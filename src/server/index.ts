@@ -15,7 +15,7 @@ const USER_DIR =
   "C:\\Users\\casey\\OneDrive\\Documents\\OpenRCT2";
 const SCREENSHOT_DIR = path.join(USER_DIR, "screenshot");
 const SAVE_DIR = path.join(USER_DIR, "save");
-const SNAPSHOT_ROOT = "agent"; // under SAVE_DIR/agent/<play>/<label>.park
+const SNAPSHOT_ROOT = "agent"; // filename prefix: SAVE_DIR/agent__<play>__<label>.park
 const DELETE_CAPTURES = process.env.RCT2_KEEP_CAPTURES ? false : true;
 
 const client = new RctClient(PORT);
@@ -162,6 +162,11 @@ passthrough("set_park_entry_fee",
   { amount: z.number().min(0) },
   Methods.SetParkEntryFee);
 
+passthrough("set_park_open",
+  "Open or close the park itself to the public. This is separate from individual ride open/closed status — guests never spawn while the park is closed, regardless of how many rides are open.",
+  { open: z.boolean() },
+  Methods.SetParkOpen);
+
 passthrough("open_ride", "Open a ride.",
   { ride_id: z.number().int() }, Methods.OpenRide);
 passthrough("close_ride", "Close a ride.",
@@ -270,45 +275,57 @@ passthrough("advance_days",
 // 5. SAVE / LOAD (snapshots; restore is a manual Load in-game)
 // ===========================================================================
 
+/**
+ * Snapshot names are flat files in the save root: `agent__<play>__<label>.park`.
+ * context.saveGame refuses any filename containing a path separator (it fails
+ * silently — the plugin gets no error back), so subfolders are not an option
+ * and the play name is folded into the filename instead. "_" is not allowed in
+ * either part, which keeps "__" an unambiguous separator when parsing back.
+ */
+const snapPart = (s: string) => String(s).replace(/[^A-Za-z0-9.-]/g, "-");
+const snapName = (play: string, label: string) => `${SNAPSHOT_ROOT}__${play}__${label}`;
+
 server.registerTool("snapshot",
-  { description: "Save a snapshot into save/agent/<play>/<label>.park. Restoring is a manual Load in the game — this only writes the save.",
+  { description: "Save a snapshot as save/agent__<play>__<label>.park, which shows up in the in-game Load Game menu. Restoring is a manual Load in the game — this only writes the save.",
     inputSchema: {
-      play: z.string().optional().describe("Playthrough folder name (default 'play')"),
+      play: z.string().optional().describe("Playthrough name (default 'play')"),
       label: z.string().describe("Snapshot name, e.g. 'week-12-pricing'"),
     } },
   async (a: any) => {
-    const play = (a.play ?? "play").replace(/[^A-Za-z0-9._-]/g, "_");
-    const label = String(a.label).replace(/[^A-Za-z0-9._-]/g, "_");
-    const filename = `${SNAPSHOT_ROOT}/${play}/${label}`;
+    const play = snapPart(a.play ?? "play");
+    const label = snapPart(a.label);
+    const filename = snapName(play, label);
+    const file = path.join(SAVE_DIR, `${filename}.park`);
     try {
       const result: any = await client.call(Methods.Snapshot, { filename }, 20000);
-      return jsonText({ ...result, play, label, note: "To roll back, load this file from the in-game Load Game menu." });
+      // saveGame returns void and swallows its own write errors, so confirm the
+      // file actually landed rather than reporting a save that never happened.
+      if (!fs.existsSync(file)) {
+        return errText(`the game reported no error but nothing was written to ${file} — check the OpenRCT2 console for a save error`);
+      }
+      return jsonText({ ...result, play, label, file, note: "To roll back, load this file from the in-game Load Game menu." });
     } catch (e: any) {
       return errText(e?.message ?? String(e));
     }
   });
 
 server.registerTool("list_snapshots",
-  { description: "List saved snapshots for a playthrough (reads save/agent/<play>).",
-    inputSchema: { play: z.string().optional().describe("Playthrough folder (default 'play'); omit to list all") } },
+  { description: "List saved snapshots (reads save/agent__*.park).",
+    inputSchema: { play: z.string().optional().describe("Playthrough to filter by; omit to list all") } },
   async (a: any) => {
     try {
-      const base = path.join(SAVE_DIR, SNAPSHOT_ROOT);
-      const target = a.play ? path.join(base, String(a.play).replace(/[^A-Za-z0-9._-]/g, "_")) : base;
-      if (!fs.existsSync(target)) return jsonText({ snapshots: [], note: `no snapshots yet at ${target}` });
+      const wanted = a.play ? snapPart(a.play) : null;
+      const prefix = `${SNAPSHOT_ROOT}__`;
       const out: Array<{ play: string; label: string; savedAt: string; file: string }> = [];
-      const walk = (dir: string, play: string) => {
-        for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
-          const p = path.join(dir, entry.name);
-          if (entry.isDirectory()) walk(p, entry.name);
-          else if (entry.name.endsWith(".park")) {
-            const st = fs.statSync(p);
-            out.push({ play, label: entry.name.replace(/\.park$/, ""), savedAt: st.mtime.toISOString(), file: p });
-          }
-        }
-      };
-      walk(target, a.play ? String(a.play) : "");
+      for (const entry of fs.readdirSync(SAVE_DIR, { withFileTypes: true })) {
+        if (!entry.isFile() || !entry.name.startsWith(prefix) || !entry.name.endsWith(".park")) continue;
+        const [play, ...rest] = entry.name.slice(prefix.length, -".park".length).split("__");
+        if (!rest.length || (wanted && play !== wanted)) continue;
+        const p = path.join(SAVE_DIR, entry.name);
+        out.push({ play, label: rest.join("__"), savedAt: fs.statSync(p).mtime.toISOString(), file: p });
+      }
       out.sort((x, y) => y.savedAt.localeCompare(x.savedAt));
+      if (!out.length) return jsonText({ snapshots: [], note: `no snapshots yet in ${SAVE_DIR}` });
       return jsonText({ count: out.length, snapshots: out });
     } catch (e: any) {
       return errText(e?.message ?? String(e));

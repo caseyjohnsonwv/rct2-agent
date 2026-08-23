@@ -94,8 +94,11 @@ claude mcp add rct2-agent --scope project \
   **tiles** (converted to map units internally).
 - **`advance_days`** unpauses, runs at max speed, and auto-pauses when the target
   date is reached — then returns the new clock. It blocks until done.
-- **Snapshots** save to `save/agent/<play>/<label>.park`. Restoring is a **manual
-  Load** in-game — the plugin API can save but not load a park.
+- **Snapshots** save to `save/agent__<play>__<label>.park`, flat in the save root
+  so they appear in the in-game Load Game menu — `context.saveGame` silently
+  refuses any filename with a path separator, so subfolders are not possible.
+  Restoring is a **manual Load** in-game — the plugin API can save but not load
+  a park.
 - **Writes go through game actions**, so the game's own limits apply (e.g. the
   ride price cap). A rejected action comes back as a tool error.
 

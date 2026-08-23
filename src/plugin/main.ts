@@ -161,6 +161,7 @@ handlers[Methods.GetParkSummary] = (_p, ok) => {
     suggestedGuestMaximum: park.suggestedGuestMaximum,
     entryFee: dollars(park.entranceFee),
     totalAdmissions: park.totalAdmissions,
+    open: park.getFlag("open"),
     ...clockInfo(),
   });
 };
@@ -327,6 +328,16 @@ handlers[Methods.SetParkEntryFee] = (p, ok, fail) => {
   const value = money(num(p, "amount"));
   execAction("parksetentrancefee", { value })
     .then(() => ok({ entryFee: dollars(value) }))
+    .catch((e) => fail(String(e.message || e)));
+};
+
+// ParkSetParameter: parameter 0 = close park, 1 = open park. Separate from
+// individual ride open/closed status — guests never spawn while the park
+// itself is closed, regardless of ride status.
+handlers[Methods.SetParkOpen] = (p, ok, fail) => {
+  const open = bool(p, "open", true);
+  execAction("parksetparameter", { parameter: open ? 1 : 0, value: 0 })
+    .then(() => ok({ open }))
     .catch((e) => fail(String(e.message || e)));
 };
 
@@ -563,9 +574,15 @@ handlers[Methods.AdvanceDays] = (p, ok, fail) => {
 // --- save ------------------------------------------------------------------
 
 handlers[Methods.Snapshot] = (p, ok, fail) => {
-  // filename is relative to the save directory (without .park). The server
-  // composes the play/label path; we try it as-is (subfolders if supported).
+  // filename is a leaf name in the save directory (without .park). saveGame
+  // silently drops anything containing a path separator, so reject those here
+  // instead of reporting a save that never happened; the server verifies the
+  // file landed either way.
   const filename = str(p, "filename");
+  if (/[\\/]/.test(filename)) {
+    fail(`snapshot filename must not contain a path separator: ${filename}`);
+    return;
+  }
   try {
     context.saveGame({ filename });
     ok({ filename, savedTo: `${filename}.park` });

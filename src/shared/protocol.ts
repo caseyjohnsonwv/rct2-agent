@@ -60,6 +60,7 @@ export const Methods = {
   SetRidePrice: "set_ride_price",
   SetShopPrice: "set_shop_price",
   SetParkEntryFee: "set_park_entry_fee",
+  SetParkOpen: "set_park_open",
   OpenRide: "open_ride",
   CloseRide: "close_ride",
   SetInspectionInterval: "set_inspection_interval",
