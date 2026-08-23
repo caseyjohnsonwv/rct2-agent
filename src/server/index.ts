@@ -1,0 +1,329 @@
+import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
+import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
+import { z, type ZodRawShape } from "zod";
+import fs from "node:fs";
+import path from "node:path";
+import { RctClient } from "./rct-client";
+import { DEFAULT_PORT, Methods } from "../shared/protocol";
+
+// --- config ----------------------------------------------------------------
+
+const PORT = Number(process.env.RCT2_PORT || DEFAULT_PORT);
+// OpenRCT2 user directory (Windows path, since the server runs under Windows node).
+const USER_DIR =
+  process.env.RCT2_USER_DIR ||
+  "C:\\Users\\casey\\OneDrive\\Documents\\OpenRCT2";
+const SCREENSHOT_DIR = path.join(USER_DIR, "screenshot");
+const SAVE_DIR = path.join(USER_DIR, "save");
+const SNAPSHOT_ROOT = "agent"; // under SAVE_DIR/agent/<play>/<label>.park
+const DELETE_CAPTURES = process.env.RCT2_KEEP_CAPTURES ? false : true;
+
+const client = new RctClient(PORT);
+
+// --- helpers ---------------------------------------------------------------
+
+function jsonText(value: unknown) {
+  return { content: [{ type: "text" as const, text: JSON.stringify(value, null, 2) }] };
+}
+function errText(message: string) {
+  return { isError: true, content: [{ type: "text" as const, text: `Error: ${message}` }] };
+}
+
+const server = new McpServer({ name: "rct2-agent", version: "0.1.0" });
+
+/** Register a tool that forwards args straight to a plugin method and returns JSON. */
+function passthrough(
+  name: string,
+  description: string,
+  inputSchema: ZodRawShape,
+  method: string,
+  opts: { timeoutMs?: number; map?: (args: any) => Record<string, unknown> } = {},
+) {
+  server.registerTool(name, { description, inputSchema }, async (args: any) => {
+    try {
+      const params = opts.map ? opts.map(args) : (args ?? {});
+      const result = await client.call(method, params, opts.timeoutMs ?? 30000);
+      return jsonText(result);
+    } catch (e: any) {
+      return errText(e?.message ?? String(e));
+    }
+  });
+}
+
+// wait for a capture file to appear, read it, base64 it, optionally delete it.
+async function readCapture(filename: string): Promise<{ data: string } | { error: string }> {
+  const full = path.join(SCREENSHOT_DIR, filename);
+  const deadline = Date.now() + 6000;
+  while (Date.now() < deadline) {
+    try {
+      const st = fs.statSync(full);
+      if (st.size > 0) {
+        // give the writer a beat to finish flushing, then read.
+        await new Promise((r) => setTimeout(r, 120));
+        const buf = fs.readFileSync(full);
+        if (DELETE_CAPTURES) {
+          try { fs.unlinkSync(full); } catch { /* ignore */ }
+        }
+        return { data: buf.toString("base64") };
+      }
+    } catch {
+      /* not there yet */
+    }
+    await new Promise((r) => setTimeout(r, 150));
+  }
+  return { error: `capture file did not appear at ${full} within timeout` };
+}
+
+async function captureTool(method: string, params: Record<string, unknown>) {
+  try {
+    const res: any = await client.call(method, params, 15000);
+    const filename: string = res.filename;
+    const img = await readCapture(filename);
+    if ("error" in img) return errText(img.error);
+    return {
+      content: [
+        { type: "image" as const, data: img.data, mimeType: "image/png" },
+        { type: "text" as const, text: JSON.stringify({ filename, zoom: res.zoom, rotation: res.rotation }) },
+      ],
+    };
+  } catch (e: any) {
+    return errText(e?.message ?? String(e));
+  }
+}
+
+// ===========================================================================
+// 1. READ — the eyes
+// ===========================================================================
+
+passthrough("get_park_summary",
+  "Park snapshot: cash, loan, park/company value, rating, guests, entry fee, and the current in-game date.",
+  {}, Methods.GetParkSummary);
+
+passthrough("get_finance_report",
+  "Current-month income and cost broken down by category (income positive, costs negative), plus net and cash.",
+  {}, Methods.GetFinanceReport);
+
+passthrough("list_rides",
+  "Every ride (not shops): price, ratings, queue time, hourly income, total profit/customers, satisfaction, reliability, breakdown, inspection interval.",
+  {}, Methods.ListRides);
+
+passthrough("get_ride",
+  "Full detail for one ride by id.",
+  { ride_id: z.number().int().describe("Ride id from list_rides") },
+  Methods.GetRide);
+
+passthrough("list_shops",
+  "Stalls and facilities with their item prices, hourly income, total profit, and customers.",
+  {}, Methods.ListShops);
+
+passthrough("get_guest_overview",
+  "Guest count, average happiness (0-100), average cash, and counts of hungry / thirsty / need-toilet / lost / unhappy guests.",
+  {}, Methods.GetGuestOverview);
+
+passthrough("sample_guest_thoughts",
+  "Recent guest thoughts grouped and counted, most common first (e.g. '38 guests: X costs too much'). Cheap signal — does not dump every guest.",
+  { limit: z.number().int().min(1).max(100).optional().describe("Max distinct thoughts to return (default 20)") },
+  Methods.SampleGuestThoughts, { map: (a) => ({ limit: a.limit ?? 20 }) });
+
+passthrough("list_staff",
+  "Staff grouped by type (handyman / mechanic / security / entertainer) with ids and energy.",
+  {}, Methods.ListStaff);
+
+passthrough("get_scenario",
+  "Scenario objective, deadline, status, and rating-warning days — the win/lose condition the agent is playing toward.",
+  {}, Methods.GetScenario);
+
+// ===========================================================================
+// 2. ACT — the hands (all writes go through game actions; game limits apply)
+// ===========================================================================
+
+passthrough("set_ride_price",
+  "Set a ride's admission price in dollars. Honors the game's price cap.",
+  {
+    ride_id: z.number().int(),
+    price: z.number().min(0).describe("Price in dollars, e.g. 3.50"),
+    is_primary: z.boolean().optional().describe("Primary (admission) vs secondary (on-ride photo) price. Default true."),
+  },
+  Methods.SetRidePrice,
+  { map: (a) => ({ ride_id: a.ride_id, price: a.price, is_primary: a.is_primary ?? true }) });
+
+passthrough("set_shop_price",
+  "Set a shop/stall item price in dollars.",
+  {
+    shop_id: z.number().int(),
+    price: z.number().min(0),
+    is_primary: z.boolean().optional().describe("Primary item vs secondary item price. Default true."),
+  },
+  Methods.SetShopPrice,
+  { map: (a) => ({ shop_id: a.shop_id, price: a.price, is_primary: a.is_primary ?? true }) });
+
+passthrough("set_park_entry_fee",
+  "Set the park entrance fee in dollars.",
+  { amount: z.number().min(0) },
+  Methods.SetParkEntryFee);
+
+passthrough("open_ride", "Open a ride.",
+  { ride_id: z.number().int() }, Methods.OpenRide);
+passthrough("close_ride", "Close a ride.",
+  { ride_id: z.number().int() }, Methods.CloseRide);
+
+passthrough("set_inspection_interval",
+  "Set how often a ride is inspected, in minutes (10/20/30/45/60/120; 0 or >120 = never). Fewer breakdowns.",
+  { ride_id: z.number().int(), minutes: z.number().int() },
+  Methods.SetInspectionInterval);
+
+passthrough("start_marketing_campaign",
+  "Start a marketing campaign for N weeks. Types: free_park_entry, free_ride, half_price_park_entry, free_food_drink, advertise_park, advertise_ride. Ride/food campaigns need 'item' (a ride id).",
+  {
+    type: z.enum(["free_park_entry", "free_ride", "half_price_park_entry", "free_food_drink", "advertise_park", "advertise_ride"]),
+    weeks: z.number().int().min(1),
+    item: z.number().int().optional().describe("Ride id (or shop item), for ride/food campaigns"),
+  },
+  Methods.StartMarketingCampaign,
+  { map: (a) => ({ type: a.type, weeks: a.weeks, item: a.item ?? 0 }) });
+
+passthrough("set_research_funding",
+  "Set research funding level: 0 none, 1 minimum, 2 normal, 3 maximum.",
+  { level: z.number().int().min(0).max(3) },
+  Methods.SetResearchFunding);
+
+passthrough("hire_staff",
+  "Hire one staff member: handyman, mechanic, security, or entertainer. Returns the new staff id.",
+  { type: z.enum(["handyman", "mechanic", "security", "entertainer"]) },
+  Methods.HireStaff);
+
+passthrough("fire_staff", "Fire a staff member by id.",
+  { staff_id: z.number().int() }, Methods.FireStaff);
+
+passthrough("set_staff_patrol",
+  "Set a staff member's patrol area as a tile rectangle (x1,y1)-(x2,y2). mode 0 = set, 1 = clear.",
+  {
+    staff_id: z.number().int(),
+    x1: z.number().int(), y1: z.number().int(),
+    x2: z.number().int(), y2: z.number().int(),
+    mode: z.number().int().optional().describe("0 set (default), 1 clear"),
+  },
+  Methods.SetStaffPatrol,
+  { map: (a) => ({ staff_id: a.staff_id, x1: a.x1, y1: a.y1, x2: a.x2, y2: a.y2, mode: a.mode ?? 0 }) });
+
+passthrough("set_loan",
+  "Set the outstanding bank loan in dollars (borrow more or repay). Capped by the scenario's max loan.",
+  { amount: z.number().min(0) },
+  Methods.SetLoan);
+
+// ===========================================================================
+// 3. SEE — vision
+// ===========================================================================
+
+server.registerTool("capture_view",
+  { description: "Screenshot the park. Optionally center on tile (x,y). zoom 0=1:1,1=2:1,2=4:1; rotation 0-3.",
+    inputSchema: {
+      x: z.number().optional().describe("Center tile X (optional)"),
+      y: z.number().optional().describe("Center tile Y (optional)"),
+      zoom: z.number().int().min(0).max(3).optional(),
+      rotation: z.number().int().min(0).max(3).optional(),
+    } },
+  async (a: any) => {
+    const params: Record<string, unknown> = { zoom: a.zoom ?? 1, rotation: a.rotation ?? 0 };
+    if (a.x !== undefined) params.x = a.x;
+    if (a.y !== undefined) params.y = a.y;
+    return captureTool(Methods.CaptureView, params);
+  });
+
+server.registerTool("capture_ride",
+  { description: "Screenshot centered on one ride.",
+    inputSchema: {
+      ride_id: z.number().int(),
+      zoom: z.number().int().min(0).max(3).optional(),
+      rotation: z.number().int().min(0).max(3).optional(),
+    } },
+  async (a: any) => captureTool(Methods.CaptureRide, { ride_id: a.ride_id, zoom: a.zoom ?? 0, rotation: a.rotation ?? 0 }));
+
+passthrough("find_location",
+  "Find tile coordinates for a named ride (substring match). Use the result with capture_view.",
+  { name: z.string() },
+  Methods.FindLocation);
+
+// ===========================================================================
+// 4. CONTROL TIME
+// ===========================================================================
+
+passthrough("get_clock", "Current in-game date, game speed, and paused state.",
+  {}, Methods.GetClock);
+
+passthrough("set_game_speed", "Set game speed 0-4 (0 normal ... 4 hyper).",
+  { speed: z.number().int().min(0).max(4) }, Methods.SetGameSpeed);
+
+passthrough("pause", "Pause the game.", {}, Methods.Pause);
+passthrough("resume", "Resume the game.", {}, Methods.Resume);
+
+passthrough("advance_days",
+  "Run the game forward N in-game days at high speed, then auto-pause and return the new clock. The core measure→act→wait→measure tool. Blocks until done.",
+  {
+    days: z.number().int().min(1).max(365),
+    max_speed: z.number().int().min(1).max(4).optional().describe("Speed to run at while advancing (default 4)"),
+  },
+  Methods.AdvanceDays,
+  { timeoutMs: 240000, map: (a) => ({ days: a.days, max_speed: a.max_speed ?? 4 }) });
+
+// ===========================================================================
+// 5. SAVE / LOAD (snapshots; restore is a manual Load in-game)
+// ===========================================================================
+
+server.registerTool("snapshot",
+  { description: "Save a snapshot into save/agent/<play>/<label>.park. Restoring is a manual Load in the game — this only writes the save.",
+    inputSchema: {
+      play: z.string().optional().describe("Playthrough folder name (default 'play')"),
+      label: z.string().describe("Snapshot name, e.g. 'week-12-pricing'"),
+    } },
+  async (a: any) => {
+    const play = (a.play ?? "play").replace(/[^A-Za-z0-9._-]/g, "_");
+    const label = String(a.label).replace(/[^A-Za-z0-9._-]/g, "_");
+    const filename = `${SNAPSHOT_ROOT}/${play}/${label}`;
+    try {
+      const result: any = await client.call(Methods.Snapshot, { filename }, 20000);
+      return jsonText({ ...result, play, label, note: "To roll back, load this file from the in-game Load Game menu." });
+    } catch (e: any) {
+      return errText(e?.message ?? String(e));
+    }
+  });
+
+server.registerTool("list_snapshots",
+  { description: "List saved snapshots for a playthrough (reads save/agent/<play>).",
+    inputSchema: { play: z.string().optional().describe("Playthrough folder (default 'play'); omit to list all") } },
+  async (a: any) => {
+    try {
+      const base = path.join(SAVE_DIR, SNAPSHOT_ROOT);
+      const target = a.play ? path.join(base, String(a.play).replace(/[^A-Za-z0-9._-]/g, "_")) : base;
+      if (!fs.existsSync(target)) return jsonText({ snapshots: [], note: `no snapshots yet at ${target}` });
+      const out: Array<{ play: string; label: string; savedAt: string; file: string }> = [];
+      const walk = (dir: string, play: string) => {
+        for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
+          const p = path.join(dir, entry.name);
+          if (entry.isDirectory()) walk(p, entry.name);
+          else if (entry.name.endsWith(".park")) {
+            const st = fs.statSync(p);
+            out.push({ play, label: entry.name.replace(/\.park$/, ""), savedAt: st.mtime.toISOString(), file: p });
+          }
+        }
+      };
+      walk(target, a.play ? String(a.play) : "");
+      out.sort((x, y) => y.savedAt.localeCompare(x.savedAt));
+      return jsonText({ count: out.length, snapshots: out });
+    } catch (e: any) {
+      return errText(e?.message ?? String(e));
+    }
+  });
+
+// ===========================================================================
+
+async function main() {
+  const transport = new StdioServerTransport();
+  await server.connect(transport);
+  process.stderr.write(`[rct2-agent] MCP server ready (plugin port ${PORT}, user dir ${USER_DIR})\n`);
+}
+
+main().catch((e) => {
+  process.stderr.write(`[rct2-agent] fatal: ${e?.stack ?? e}\n`);
+  process.exit(1);
+});

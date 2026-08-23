@@ -1,0 +1,23 @@
+{
+  "name": "rct2-agent",
+  "version": "0.1.0",
+  "private": true,
+  "description": "MCP bridge that lets an agent sidecar-manage an OpenRCT2 park (read state, act on the business, see the park, control time).",
+  "type": "module",
+  "scripts": {
+    "build": "node esbuild.mjs",
+    "build:plugin": "node esbuild.mjs plugin",
+    "build:server": "node esbuild.mjs server",
+    "install:plugin": "node scripts/install-plugin.mjs",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.0.4",
+    "zod": "^3.23.8"
+  },
+  "devDependencies": {
+    "@types/node": "^20.12.0",
+    "esbuild": "^0.23.0",
+    "typescript": "^5.5.0"
+  }
+}

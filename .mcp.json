@@ -1,0 +1,14 @@
+{
+  "mcpServers": {
+    "rct2-agent": {
+      "command": "/mnt/c/Program Files/nodejs/node.exe",
+      "args": [
+        "C:\\Users\\casey\\OneDrive\\Desktop\\dead code projects\\rct2-agent\\dist\\server.mjs"
+      ],
+      "env": {
+        "RCT2_PORT": "7860",
+        "RCT2_USER_DIR": "C:\\Users\\casey\\OneDrive\\Documents\\OpenRCT2"
+      }
+    }
+  }
+}
