@@ -12,7 +12,9 @@
  */
 
 import {
+  COORDS_Z_STEP,
   DEFAULT_PORT,
+  LAND_STEP_Z,
   MONEY_FACTOR,
   Methods,
   type RpcRequest,
@@ -87,9 +89,430 @@ function clockInfo() {
   };
 }
 
+// --- tiles & footpaths -----------------------------------------------------
+
+interface TileCoord {
+  x: number;
+  y: number;
+  z?: number;
+  direction?: number;
+  /** Tile a footpath must occupy to connect here. Entrances/exits only. */
+  connectAt?: { x: number; y: number; z: number };
+}
+
+/**
+ * Tile offsets per direction, matching OpenRCT2's CoordsDirectionDelta:
+ * 0 = -X, 1 = +Y, 2 = +X, 3 = -Y.
+ */
+const DIRECTION_DELTA = [
+  { dx: -1, dy: 0 },
+  { dx: 0, dy: 1 },
+  { dx: 1, dy: 0 },
+  { dx: 0, dy: -1 },
+];
+
+/**
+ * Convert a game CoordsXY(ZD) to tile coordinates, keeping z in world units.
+ * Unbuilt ride entrances/exits come back as a null-ish sentinel; report null.
+ */
+function tileCoords(c: CoordsXY | CoordsXYZ | CoordsXYZD | null | undefined): TileCoord | null {
+  if (!c) return null;
+  // 0x8000 is the "location null" sentinel used throughout the game.
+  if (c.x === null || c.x === undefined || (c.x & 0xffff) === 0x8000) return null;
+  if (c.x < 0 || c.y < 0) return null;
+  const out: TileCoord = {
+    x: Math.floor(c.x / TILE),
+    y: Math.floor(c.y / TILE),
+  };
+  if ("z" in c && typeof (c as CoordsXYZ).z === "number") out.z = (c as CoordsXYZ).z;
+  if ("direction" in c && typeof (c as CoordsXYZD).direction === "number") {
+    out.direction = (c as CoordsXYZD).direction;
+  }
+  return out;
+}
+
+/**
+ * The tile a footpath has to sit on to reach a ride entrance or exit.
+ *
+ * An entrance element's `direction` points INTO the ride, so the guest-facing
+ * tile is the one opposite it, at the entrance's own height. Callers should
+ * build here rather than re-deriving the direction convention.
+ */
+function apronTile(x: number, y: number, z: number, direction: number) {
+  const d = DIRECTION_DELTA[(direction + 2) & 3];
+  return { x: x + d.dx, y: y + d.dy, z };
+}
+
+/** tileCoords plus the apron tile, for ride entrances and exits. */
+function accessCoords(c: CoordsXYZD | null | undefined): TileCoord | null {
+  const t = tileCoords(c);
+  if (!t || t.z === undefined || t.direction === undefined) return t;
+  t.connectAt = apronTile(t.x, t.y, t.z, t.direction);
+  return t;
+}
+
+function surfaceOf(tile: Tile): SurfaceElement | null {
+  for (const el of tile.elements) {
+    if (el.type === "surface") return el as SurfaceElement;
+  }
+  return null;
+}
+
+/**
+ * World z of the ground at a tile. A footpath laid flat on the ground shares
+ * the surface element's base z; on a sloped surface that is the low corner.
+ */
+function groundZ(tile: Tile): number | null {
+  const surf = surfaceOf(tile);
+  return surf ? surf.baseZ : null;
+}
+
+/**
+ * World z of the HIGHEST corner of a tile's surface. Surface slope bits 0-3
+ * mark raised corners and bit 4 marks a double-height ("steep") slope, each
+ * worth one land step. A flat path on sloping ground has to sit up here;
+ * baseZ (the low corner) is only valid for a path sloped to match.
+ */
+const SURFACE_SLOPE_CORNERS = 0x0f;
+const SURFACE_SLOPE_STEEP = 0x10;
+function surfaceTopZ(surf: SurfaceElement): number {
+  let z = surf.baseZ;
+  if (surf.slope & SURFACE_SLOPE_CORNERS) z += LAND_STEP_Z;
+  if (surf.slope & SURFACE_SLOPE_STEEP) z += LAND_STEP_Z;
+  return z;
+}
+
+/** Direction labels matching DIRECTION_DELTA: 0 = -X, 1 = +Y, 2 = +X, 3 = -Y. */
+const DIRECTION_LABEL = ["-X", "+Y", "+X", "-Y"];
+
+/**
+ * World z of each of a path tile's four edges, indexed by direction.
+ *
+ * A flat path presents its own baseZ on all four sides. A sloped path rises one
+ * land level toward `slopeDirection`, so that side sits a level up while the
+ * opposite side stays at baseZ. The two perpendicular sides are mid-slope and
+ * the game never connects through them, so they come back null -- "no edge to
+ * meet here", as distinct from an edge that happens to sit at z 0.
+ *
+ * Two neighbouring paths connect only when the edges they turn to each other
+ * are both non-null and exactly equal.
+ */
+function pathEdgeZ(baseZ: number, slopeDirection: number | null | undefined): Array<number | null> {
+  if (slopeDirection === null || slopeDirection === undefined) {
+    return [baseZ, baseZ, baseZ, baseZ];
+  }
+  const d = slopeDirection & 3;
+  const edges: Array<number | null> = [null, null, null, null];
+  edges[d] = baseZ + LAND_STEP_Z;
+  edges[(d + 2) & 3] = baseZ;
+  return edges;
+}
+
+/** pathEdgeZ keyed by direction label, so readers never do index arithmetic. */
+function edgeZLabelled(baseZ: number, slopeDirection: number | null | undefined) {
+  const out: Record<string, number | null> = {};
+  const e = pathEdgeZ(baseZ, slopeDirection);
+  for (let d = 0; d < 4; d++) out[DIRECTION_LABEL[d]] = e[d];
+  return out;
+}
+
+/** A height difference said in the units routes are actually built in. */
+function levelsApart(diff: number): string {
+  const n = Math.abs(diff) / LAND_STEP_Z;
+  if (n !== Math.floor(n)) return `${Math.abs(diff)} z units`;
+  return `${n} land level${n === 1 ? "" : "s"}`;
+}
+
+/**
+ * What the path at (x,y,z) actually touches -- and what it only appears to.
+ *
+ * A footpath's own `edges` bitmask answers the first half, after the fact and
+ * as a bitmask. It says nothing about the second: a path one land level off its
+ * neighbour reads as a continuous route from above and is not walkable. Naming
+ * those near misses at placement time is the whole point, because otherwise the
+ * break surfaces many tiles later, if at all.
+ */
+function connectivityAt(x: number, y: number, z: number) {
+  let found: FootpathElement | null = null;
+  for (const el of map.getTile(x, y).elements) {
+    if (el.type === "footpath" && el.baseZ === z) { found = el as FootpathElement; break; }
+  }
+  if (!found) return null;
+  const me = found;
+
+  const mySlope = me.slopeDirection;
+  const myEdges = pathEdgeZ(me.baseZ, mySlope);
+  const connectedTo: Array<Record<string, unknown>> = [];
+  const notConnected: Array<Record<string, unknown>> = [];
+
+  for (let d = 0; d < 4; d++) {
+    const nx = x + DIRECTION_DELTA[d].dx;
+    const ny = y + DIRECTION_DELTA[d].dy;
+    if (nx < 0 || ny < 0 || nx >= map.size.x || ny >= map.size.y) continue;
+    const side = DIRECTION_LABEL[d];
+    const myEdge = myEdges[d];
+    const opp = (d + 2) & 3;
+
+    for (const el of map.getTile(nx, ny).elements) {
+      if (el.type === "footpath") {
+        const f = el as FootpathElement;
+        const kind = f.isQueue ? "queue" : "footpath";
+        const theirEdge = pathEdgeZ(f.baseZ, f.slopeDirection)[opp];
+        const who: Record<string, unknown> = { x: nx, y: ny, side, direction: d, z: f.baseZ, type: kind };
+        if (f.isQueue) who.ride = f.ride;
+
+        if (myEdge !== null && theirEdge !== null && myEdge === theirEdge) {
+          connectedTo.push(who);
+        } else if (myEdge === null) {
+          who.reason = `this tile slopes toward ${DIRECTION_LABEL[(mySlope as number) & 3]}, so its ${side} side is mid-slope; a sloped path connects only at the two ends of its slope`;
+          notConnected.push(who);
+        } else if (theirEdge === null) {
+          who.reason = `the ${kind} at (${nx},${ny}) slopes toward ${DIRECTION_LABEL[(f.slopeDirection as number) & 3]}, so the side it turns to this tile is mid-slope and cannot connect`;
+          notConnected.push(who);
+        } else {
+          who.reason = `height mismatch: this tile's ${side} edge is at z=${myEdge}, but the ${kind} at (${nx},${ny}) presents z=${theirEdge} on the facing side (${levelsApart(theirEdge - myEdge)} ${theirEdge > myEdge ? "higher" : "lower"}). Adjacent from above; guests cannot walk between them.`;
+          who.connectAtZ = theirEdge - (mySlope === d ? LAND_STEP_Z : 0);
+          notConnected.push(who);
+        }
+      } else if (el.type === "entrance") {
+        const e = el as EntranceElement;
+        const apron = apronTile(nx, ny, e.baseZ, e.direction);
+        // An entrance faces exactly one tile; skip the ones facing elsewhere.
+        if (apron.x !== x || apron.y !== y) continue;
+        const role = entranceRole(e, nx, ny);
+        const label = role === "park" ? "park entrance" : `ride ${role}`;
+        const who: Record<string, unknown> = {
+          x: nx, y: ny, side, direction: d, z: e.baseZ,
+          type: role === "park" ? "park_entrance" : `ride_${role}`,
+          ride: e.ride,
+        };
+        // An entrance takes a flat path at exactly its own z; a ramp will not do.
+        if (mySlope === null && me.baseZ === e.baseZ) {
+          connectedTo.push(who);
+        } else {
+          who.reason = mySlope !== null
+            ? `the ${label} at (${nx},${ny}) needs a FLAT path on this tile at z=${e.baseZ}; this tile is sloped`
+            : `the ${label} at (${nx},${ny}) connects only at z=${e.baseZ}; this tile sits at z=${me.baseZ}`;
+          who.connectAtZ = e.baseZ;
+          notConnected.push(who);
+        }
+      }
+    }
+  }
+
+  return { edgeZ: edgeZLabelled(me.baseZ, mySlope), connectedTo, notConnected };
+}
+
+/**
+ * Game actions refuse to run while the game is paused, and the agent's loop
+ * leaves it paused (advance_days auto-pauses). Lift the pause for the duration
+ * of a build action and put it back afterwards; the action resolves within the
+ * same tick, so no game time passes.
+ */
+function unpauseFor(): () => void {
+  const wasPaused = context.paused;
+  if (wasPaused) context.paused = false;
+  let restored = false;
+  return () => {
+    if (restored) return;
+    restored = true;
+    if (wasPaused) context.paused = true;
+  };
+}
+
+/**
+ * Footpath objects come in two generations. New-style (NSF) parks split a path
+ * into a surface object plus a railings object; legacy parks use a single
+ * "footpath" object and need the legacy bit set in constructFlags.
+ */
+const PATH_FLAG_QUEUE = 1 << 0;
+const PATH_FLAG_LEGACY = 1 << 1;
+
+interface PathStyle {
+  legacy: boolean;
+  object: number;
+  railingsObject: number;
+}
+
+function pathStyleList(queue: boolean): PathStyle[] {
+  const out: PathStyle[] = [];
+  const surfaces = objectManager.getAllObjects("footpath_surface") || [];
+  if (surfaces.length > 0) {
+    const railings = objectManager.getAllObjects("footpath_railings") || [];
+    const railIndex = railings.length > 0 ? railings[0].index : 0;
+    for (const sfc of surfaces) {
+      if (isQueueSurface(sfc) !== queue) continue;
+      out.push({ legacy: false, object: sfc.index, railingsObject: railIndex });
+    }
+    if (out.length > 0) return out;
+  }
+  // legacy fallback: single combined object, railings unused.
+  const legacy = objectManager.getAllObjects("footpath") || [];
+  for (const obj of legacy) {
+    out.push({ legacy: true, object: obj.index, railingsObject: 0 });
+  }
+  return out;
+}
+
+/**
+ * Queue surfaces are flagged by the object; older/DAT-derived objects do not
+ * always set it, so fall back to the localised name.
+ */
+const FOOTPATH_SURFACE_FLAG_IS_QUEUE = 1 << 3; // FOOTPATH_ENTRY_FLAG_IS_QUEUE
+function isQueueSurface(sfc: FootpathSurfaceObject): boolean {
+  if ((sfc.flags & FOOTPATH_SURFACE_FLAG_IS_QUEUE) !== 0) return true;
+  return sfc.name.toLowerCase().indexOf("queue") >= 0;
+}
+
+/** Resolve the style to build with, honouring an explicit object index. */
+function resolvePathStyle(
+  explicitObject: number | undefined,
+  explicitRailings: number | undefined,
+  queue: boolean,
+): PathStyle {
+  const styles = pathStyleList(queue);
+  if (styles.length === 0) {
+    throw new Error(
+      `no ${queue ? "queue" : "footpath"} objects are loaded in this park; call list_path_styles`,
+    );
+  }
+  const chosen = explicitObject === undefined
+    ? styles[0]
+    : { legacy: styles[0].legacy, object: explicitObject, railingsObject: styles[0].railingsObject };
+  if (explicitRailings !== undefined) chosen.railingsObject = explicitRailings;
+  return chosen;
+}
+
+/**
+ * A tile can carry water and still be buildable: on a shoreline the surface's
+ * high corner reaches the waterline or above, and a path can sit on it -- the
+ * game allows a path level with the water, so only water strictly above the
+ * high corner puts the tile out of reach.
+ */
+function isSubmerged(surf: SurfaceElement | null): boolean {
+  return !!surf && surf.waterHeight > 0 && surf.waterHeight > surfaceTopZ(surf);
+}
+
+/**
+ * An entrance element covers ride entrances, ride exits and the park entrance
+ * alike, and the plugin API exposes no type field. Work it out by asking the
+ * ride whether this tile is its station's entrance or its exit.
+ */
+function entranceRole(e: EntranceElement, x: number, y: number): string {
+  let r: Ride | null = null;
+  try {
+    r = e.ride === null || e.ride === undefined ? null : map.getRide(e.ride);
+  } catch (_err) {
+    r = null;
+  }
+  if (!r) return "park";
+  const stations = r.stations || [];
+  const st = e.station === null || e.station === undefined ? null : stations[e.station];
+  if (!st) return "unknown";
+  const en = tileCoords(st.entrance);
+  if (en && en.x === x && en.y === y) return "entrance";
+  const ex = tileCoords(st.exit);
+  if (ex && ex.x === x && ex.y === y) return "exit";
+  return "unknown";
+}
+
+/**
+ * Whether a footpath actually reaches an apron tile, and if not, why. Height
+ * matters as much as position: a path on the right tile at the wrong z does
+ * not connect. Blocker reporting is a hint -- place_path's own query is the
+ * authority on whether a given tile will take a path.
+ */
+function apronStatus(a: { x: number; y: number; z: number }) {
+  const tile = map.getTile(a.x, a.y);
+  const surf = surfaceOf(tile);
+  if (!surf) return { connected: false, status: "off_map", detail: `no ground at (${a.x},${a.y})` };
+
+  const paths: FootpathElement[] = [];
+  for (const el of tile.elements) {
+    if (el.type === "footpath") paths.push(el as FootpathElement);
+  }
+  for (const f of paths) {
+    if (f.baseZ === a.z) {
+      return {
+        connected: true,
+        status: "connected",
+        detail: `${f.isQueue ? "queue" : "footpath"} present at z=${a.z}`,
+        isQueue: f.isQueue,
+        // The game binds a queue to the ride it serves; a bound queue is the
+        // engine confirming the connection rather than us inferring it.
+        queueBoundToRide: f.isQueue ? f.ride : null,
+      };
+    }
+  }
+  if (paths.length > 0) {
+    return {
+      connected: false, status: "wrong_height",
+      detail: `path here at z ${paths.map((f) => f.baseZ).join(", ")}, but this entrance needs z=${a.z}`,
+    };
+  }
+  if (!surf.hasOwnership && !surf.hasConstructionRights) {
+    return { connected: false, status: "unowned", detail: `land at (${a.x},${a.y}) is not owned` };
+  }
+  if (isSubmerged(surf)) {
+    return { connected: false, status: "under_water", detail: `(${a.x},${a.y}) is under water` };
+  }
+  const blockers: string[] = [];
+  for (const el of tile.elements) {
+    const t = el.type;
+    if (t === "small_scenery" || t === "large_scenery" || t === "wall" || t === "track" || t === "entrance") {
+      if (blockers.indexOf(t) < 0) blockers.push(t);
+    }
+  }
+  if (blockers.length > 0) {
+    return {
+      connected: false, status: "blocked",
+      detail: `(${a.x},${a.y}) is occupied by ${blockers.join(", ")}; clear it or move the entrance`,
+    };
+  }
+  return {
+    connected: false, status: "no_path",
+    detail: `nothing at (${a.x},${a.y}); place a path there at z=${a.z}`,
+  };
+}
+
+// One char per tile for the ASCII overview in inspect_area.
+function tileGlyph(tile: Tile, surf: SurfaceElement | null): string {
+  let glyph = ".";
+  let sawPath = false;
+  for (const el of tile.elements) {
+    switch (el.type) {
+      case "footpath":
+        // queue lines are worth distinguishing; they cannot be walked freely.
+        glyph = (el as FootpathElement).isQueue ? "Q" : "P";
+        sawPath = true;
+        break;
+      case "track":
+        if (!sawPath) glyph = "T";
+        break;
+      case "entrance":
+        glyph = "E";
+        sawPath = true; // entrances outrank scenery in the overview
+        break;
+      case "small_scenery":
+      case "large_scenery":
+        if (!sawPath && glyph === ".") glyph = "s";
+        break;
+      case "wall":
+        if (!sawPath && glyph === ".") glyph = "w";
+        break;
+    }
+  }
+  if (glyph === "." && isSubmerged(surf)) glyph = "~";
+  if (surf && !surf.hasOwnership && !surf.hasConstructionRights) {
+    // unowned land cannot be built on at all; flag it over anything else.
+    return glyph === "." ? "x" : glyph.toLowerCase();
+  }
+  return glyph;
+}
+
 // ride classification -> our buckets. stalls/facilities are "shops".
 function isShop(r: Ride): boolean {
-  return r.classification === "stall";
+  return r.classification === "stall" || r.classification === "facility";
 }
 
 function rideSummary(r: Ride) {
@@ -117,6 +540,27 @@ function rideSummary(r: Ride) {
   };
 }
 
+/**
+ * Rides carry a fixed-size station array (255 slots) with only the first few
+ * ever built. Emit just the real ones -- otherwise a single-station ride
+ * reports 254 empty objects.
+ */
+function realStations(r: Ride): Array<{ index: number; station: RideStation }> {
+  const out: Array<{ index: number; station: RideStation }> = [];
+  const stations = r.stations || [];
+  for (let i = 0; i < stations.length; i++) {
+    const s = stations[i];
+    if (s && s.start && tileCoords(s.start)) out.push({ index: i, station: s });
+  }
+  return out;
+}
+
+/** First built station, for centring a view or reporting a ride's location. */
+function primaryStation(r: Ride): RideStation | null {
+  const real = realStations(r);
+  return real.length > 0 ? real[0].station : null;
+}
+
 function rideDetail(r: Ride) {
   return {
     ...rideSummary(r),
@@ -129,9 +573,14 @@ function rideDetail(r: Ride) {
     maxWaitingTime: r.maximumWaitingTime,
     liftHillSpeed: r.liftHillSpeed,
     prices: (r.price || []).map((p) => dollars(p)),
-    stations: (r.stations || []).map((s, i) => ({
-      index: i,
-      queueTimeMinutes: s.queueTime,
+    // Only built stations. Tile coords are for connecting footpaths;
+    // entrance/exit stay null until that piece is built.
+    stations: realStations(r).map(({ index, station }) => ({
+      index,
+      queueTimeMinutes: station.queueTime,
+      start: tileCoords(station.start),
+      entrance: accessCoords(station.entrance),
+      exit: accessCoords(station.exit),
     })),
   };
 }
@@ -206,7 +655,7 @@ handlers[Methods.GetRide] = (p, ok, fail) => {
 };
 
 handlers[Methods.ListShops] = (_p, ok) => {
-  const shops = map.rides.filter((r) => r.classification === "stall" || r.classification === "facility");
+  const shops = map.rides.filter(isShop);
   ok({
     count: shops.length,
     shops: shops.map((r) => ({
@@ -448,6 +897,343 @@ handlers[Methods.SetLoan] = (p, ok, fail) => {
     .catch((e) => fail(String(e.message || e)));
 };
 
+// --- build: paths ----------------------------------------------------------
+
+const MAX_INSPECT_RADIUS = 12;
+
+handlers[Methods.InspectArea] = (p, ok, fail) => {
+  const cx = Math.floor(num(p, "x"));
+  const cy = Math.floor(num(p, "y"));
+  const radius = Math.max(0, Math.min(MAX_INSPECT_RADIUS, Math.floor(num(p, "radius", 6))));
+
+  // map.size is in tiles and counts the impassable border ring on each side.
+  const maxX = map.size.x - 1;
+  const maxY = map.size.y - 1;
+  const x0 = Math.max(1, cx - radius);
+  const y0 = Math.max(1, cy - radius);
+  const x1 = Math.min(maxX - 1, cx + radius);
+  const y1 = Math.min(maxY - 1, cy + radius);
+  if (x1 < x0 || y1 < y0) return fail(`area around (${cx},${cy}) is outside the map`);
+
+  const rows: string[] = [];
+  const ground: number[][] = [];
+  const groundTop: number[][] = [];
+  const slopes: number[][] = [];
+  const waters: number[][] = [];
+  const features: Array<Record<string, unknown>> = [];
+
+  for (let y = y0; y <= y1; y++) {
+    let row = "";
+    const gz: number[] = [];
+    const gt: number[] = [];
+    const sl: number[] = [];
+    const wz: number[] = [];
+    for (let x = x0; x <= x1; x++) {
+      const tile = map.getTile(x, y);
+      const surf = surfaceOf(tile);
+      row += tileGlyph(tile, surf);
+      gz.push(surf ? surf.baseZ : -1);
+      gt.push(surf ? surfaceTopZ(surf) : -1);
+      sl.push(surf ? surf.slope : 0);
+      wz.push(surf ? surf.waterHeight : 0);
+      for (const el of tile.elements) {
+        if (el.type === "footpath") {
+          const f = el as FootpathElement;
+          features.push({
+            // `edges` covers adjacent footpaths only; a ride entrance next to
+            // this tile does not show up as an edge. edgeZ is the reliable
+            // read: two neighbours connect iff the edges they turn to each
+            // other are both non-null and equal.
+            x, y, type: f.isQueue ? "queue" : "footpath",
+            z: f.baseZ,
+            slopeDirection: f.slopeDirection,
+            edgeZ: edgeZLabelled(f.baseZ, f.slopeDirection),
+            edges: f.edges,
+            ride: f.ride,
+          });
+        } else if (el.type === "entrance") {
+          const e = el as EntranceElement;
+          features.push({
+            x, y, type: "entrance",
+            role: entranceRole(e, x, y),
+            z: e.baseZ,
+            direction: e.direction,
+            ride: e.ride,
+            station: e.station,
+            // Where a path has to go to reach it -- `direction` points into
+            // the ride, so this is the tile on the far side.
+            connectAt: apronTile(x, y, e.baseZ, e.direction),
+          });
+        }
+      }
+    }
+    rows.push(row);
+    ground.push(gz);
+    groundTop.push(gt);
+    slopes.push(sl);
+    waters.push(wz);
+  }
+
+  ok({
+    origin: { x: x0, y: y0 },
+    size: { width: x1 - x0 + 1, height: y1 - y0 + 1 },
+    // Row-major, rows[0] is y === origin.y; each string is one char per tile.
+    map: rows,
+    legend: ". empty ground | P path | Q queue | E entrance | T ride/track | s scenery | w wall "
+      + "| ~ under water | lowercase or x = land not owned (cannot build). A tile with waterZ set but "
+      + "no ~ is shoreline: its high corner clears the water, so a path can still be built there.",
+    groundZ: ground,
+    groundTopZ: groundTop,
+    groundSlope: slopes,
+    waterZ: waters,
+    features,
+    zUnits: {
+      coordsZStep: COORDS_Z_STEP,
+      landStepZ: LAND_STEP_Z,
+      note: "World z. groundZ is a tile's LOW corner, groundTopZ its HIGH corner; "
+        + "they are equal on flat ground (groundSlope 0). A flat path needs z = groundTopZ. "
+        + "A path sloped to match the terrain sits at z = groundZ. Each land level is landStepZ. "
+        + "Each footpath feature carries edgeZ: the world z it presents on each of its four sides "
+        + "(-X, +Y, +X, -Y), or null where a slope's mid-slope side cannot connect at all. Two "
+        + "neighbouring paths are walkable between ONLY if the edges they turn to each other are "
+        + "both non-null and exactly equal -- compare them rather than trusting the ASCII map, "
+        + "which shows 'P' for tiles that are a land level apart and not connected.",
+    },
+  });
+};
+
+handlers[Methods.ListPathStyles] = (_p, ok) => {
+  const surfaces = objectManager.getAllObjects("footpath_surface") || [];
+  const railings = objectManager.getAllObjects("footpath_railings") || [];
+  const legacy = objectManager.getAllObjects("footpath") || [];
+  ok({
+    generation: surfaces.length > 0 ? "nsf" : "legacy",
+    surfaces: surfaces.map((o) => ({
+      index: o.index, name: o.name, identifier: o.identifier,
+      isQueue: isQueueSurface(o), flags: o.flags,
+    })),
+    railings: railings.map((o) => ({ index: o.index, name: o.name, identifier: o.identifier })),
+    legacy: legacy.map((o) => ({ index: o.index, name: o.name, identifier: o.identifier })),
+    note: "Pass `object` (and optionally `railings_object`) to place_path to override the default style.",
+  });
+};
+
+handlers[Methods.PlacePath] = (p, ok, fail) => {
+  const x = Math.floor(num(p, "x"));
+  const y = Math.floor(num(p, "y"));
+  const tile = map.getTile(x, y);
+  const gz = groundZ(tile);
+  if (gz === null) return fail(`no ground at tile (${x},${y}); is it outside the map?`);
+
+  const sloped = p.slope_direction !== undefined && p.slope_direction !== null;
+  const slopeDirection = sloped ? (Math.floor(num(p, "slope_direction")) & 3) : 0;
+  const queue = bool(p, "queue", false);
+
+  // Default z follows the terrain: a path sloped to match the ground sits on
+  // the low corner, a flat one has to sit on the high corner. They are the
+  // same number on flat ground. height_offset then shifts by whole land levels.
+  // Read the surface up front: placing the path inserts a tile element, which
+  // invalidates element handles held across the action.
+  const surf = surfaceOf(tile);
+  const existingZs: number[] = [];
+  for (const el of tile.elements) {
+    if (el.type === "footpath") existingZs.push(el.baseZ);
+  }
+  const topZ = surf ? surfaceTopZ(surf) : gz;
+  const defaultZ = sloped ? gz : topZ;
+  const baseZ = p.z !== undefined ? num(p, "z") : defaultZ;
+  const z = baseZ + Math.floor(num(p, "height_offset", 0)) * LAND_STEP_Z;
+  if (z < 0) return fail(`resolved z ${z} is below ground level`);
+
+  let style: PathStyle;
+  try {
+    style = resolvePathStyle(
+      p.object === undefined ? undefined : num(p, "object"),
+      p.railings_object === undefined ? undefined : num(p, "railings_object"),
+      queue,
+    );
+  } catch (e: any) {
+    return fail(String(e && e.message ? e.message : e));
+  }
+
+  const args = {
+    x: x * TILE,
+    y: y * TILE,
+    z,
+    // 0xFF means "no forced connection direction" -- let the game work out edges.
+    direction: 0xff,
+    object: style.object,
+    railingsObject: style.railingsObject,
+    slopeType: sloped ? 1 : 0,
+    slopeDirection: slopeDirection as Direction,
+    constructFlags: (queue ? PATH_FLAG_QUEUE : 0) | (style.legacy ? PATH_FLAG_LEGACY : 0),
+  };
+
+  // Query first so a rejected placement reports the game's own reason instead
+  // of failing silently; the agent needs that text to pick the next tile.
+  const restore = unpauseFor();
+  context.queryAction("footpathplace", args as any, (q: GameActionResult) => {
+    if (q.error && q.error !== 0) {
+      restore();
+      return fail(
+        `cannot place path at (${x},${y}) z=${z}: ${q.errorMessage || q.errorTitle || `error ${q.error}`}`,
+      );
+    }
+    execAction("footpathplace", args)
+      .then((res: GameActionResult) => {
+        restore();
+        // Re-placing an identical path is a no-op the game reports as success
+        // with no cost; say so rather than implying a tile was built.
+        const alreadyPresent = existingZs.indexOf(z) >= 0;
+        // Read the placed tile back out of the map rather than echoing the
+        // request: the game normalises slopes, and what it stored is what the
+        // next tile has to meet.
+        const conn = connectivityAt(x, y, z);
+        ok({
+          placed: true, x, y, z, groundZ: gz, groundTopZ: topZ,
+          sloped, slopeDirection: sloped ? slopeDirection : null,
+          queue, object: style.object, railingsObject: style.railingsObject,
+          cost: dollars(res.cost || 0),
+          alreadyPresent,
+          ...(conn ? {
+            edgeZ: conn.edgeZ,
+            connectedTo: conn.connectedTo,
+            neighborsNotConnected: conn.notConnected,
+            ...(conn.connectedTo.length === 0 ? {
+              warning: conn.notConnected.length > 0
+                ? "this tile connects to NOTHING: every neighbouring path or entrance was missed. "
+                  + "Read neighborsNotConnected -- connectAtZ gives the z this tile needed. "
+                  + "Do not keep extending the route until this is fixed."
+                : "this tile connects to nothing: no path or ride entrance on any of the four "
+                  + "neighbouring tiles. Expected for the first tile of a new route; otherwise "
+                  + "the route is broken here.",
+            } : {}),
+          } : {}),
+          ...(alreadyPresent
+            ? { note: "a path already existed at this tile and z; cost 0 means nothing changed" }
+            : {}),
+        });
+      })
+      .catch((e) => {
+        restore();
+        fail(`place_path (${x},${y}) z=${z}: ${String(e.message || e)}`);
+      });
+  });
+};
+
+handlers[Methods.RemovePath] = (p, ok, fail) => {
+  const x = Math.floor(num(p, "x"));
+  const y = Math.floor(num(p, "y"));
+  const tile = map.getTile(x, y);
+
+  let z: number;
+  if (p.z !== undefined) {
+    z = num(p, "z");
+  } else {
+    // No z given: unambiguous only when the tile carries exactly one path.
+    const paths = tile.elements.filter((el) => el.type === "footpath");
+    if (paths.length === 0) return fail(`no footpath on tile (${x},${y})`);
+    if (paths.length > 1) {
+      const zs = paths.map((el) => el.baseZ);
+      return fail(`tile (${x},${y}) has ${paths.length} stacked paths (z: ${zs.join(", ")}); pass z`);
+    }
+    z = paths[0].baseZ;
+  }
+
+  const restore = unpauseFor();
+  execAction("footpathremove", { x: x * TILE, y: y * TILE, z })
+    .then((res: GameActionResult) => {
+      restore();
+      ok({ removed: true, x, y, z, refund: dollars(res.cost || 0) });
+    })
+    .catch((e) => {
+      restore();
+      fail(`remove_path (${x},${y}) z=${z}: ${String(e.message || e)}`);
+    });
+};
+
+handlers[Methods.CheckRideAccess] = (p, ok, fail) => {
+  const id = num(p, "ride_id");
+  let r: Ride | null = null;
+  try {
+    r = map.getRide(id);
+  } catch (_e) {
+    r = null;
+  }
+  if (!r) return fail(`no ride with id ${id}`);
+
+  const problems: string[] = [];
+
+  // Stalls and facilities have no entrance element at all: a guest uses one
+  // from any adjacent footpath at the same height.
+  if (isShop(r)) {
+    const st = primaryStation(r);
+    const here = st ? tileCoords(st.start) : null;
+    if (!here || here.z === undefined) return fail(`shop ${id} has no placed tile to check`);
+    const adjacent = DIRECTION_DELTA.map((d, direction) => {
+      const a = { x: here.x + d.dx, y: here.y + d.dy, z: here.z as number };
+      const res = apronStatus(a);
+      return { direction, x: a.x, y: a.y, ...res };
+    });
+    const reachable = adjacent.filter((a) => a.connected);
+    if (reachable.length === 0) {
+      problems.push(
+        `${r.name} has no adjacent footpath at z=${here.z}; guests cannot reach it. `
+        + adjacent.map((a) => `(${a.x},${a.y}): ${a.detail}`).join(" | "),
+      );
+    }
+    return ok({
+      rideId: r.id, name: r.name, classification: r.classification, status: r.status,
+      connected: reachable.length > 0,
+      tile: here,
+      adjacent,
+      problems,
+      note: "Stalls have no entrance or exit element; a guest can use one from any "
+        + "adjacent footpath at the same height.",
+    });
+  }
+
+  const stations = realStations(r).map(({ index, station }) => {
+    const en = accessCoords(station.entrance);
+    const ex = accessCoords(station.exit);
+
+    const describe = (what: string, c: TileCoord | null) => {
+      if (!c || !c.connectAt) {
+        problems.push(`station ${index}: ${what} is not built`);
+        return { built: false as const };
+      }
+      const access = apronStatus(c.connectAt);
+      if (!access.connected) {
+        problems.push(`station ${index} ${what}: ${access.detail}`);
+      }
+      return {
+        built: true as const,
+        x: c.x, y: c.y, z: c.z, direction: c.direction,
+        connectAt: c.connectAt,
+        access,
+      };
+    };
+
+    return { index, entrance: describe("entrance", en), exit: describe("exit", ex) };
+  });
+
+  if (stations.length === 0) problems.push("ride has no built station");
+
+  const connected = stations.length > 0 && stations.every(
+    (s) => s.entrance.built && s.entrance.access.connected && s.exit.built && s.exit.access.connected,
+  );
+
+  ok({
+    rideId: r.id, name: r.name, classification: r.classification, status: r.status,
+    connected,
+    stations,
+    problems,
+    note: "connectAt is the tile a footpath must occupy to reach that entrance or exit "
+      + "-- build there, at the z given. Guests need BOTH the entrance and the exit "
+      + "connected before a ride works.",
+  });
+};
+
 // --- vision ----------------------------------------------------------------
 
 function doCapture(position: CoordsXY | undefined, zoom: number, rotation: number, ok: Respond) {
@@ -480,8 +1266,8 @@ handlers[Methods.CaptureRide] = (p, ok, fail) => {
   const id = num(p, "ride_id");
   const r = map.getRide(id);
   if (!r) return fail(`no ride with id ${id}`);
-  const st = r.stations && r.stations.length > 0 ? r.stations[0] : null;
-  if (!st || !st.start) return fail(`ride ${id} has no station to center on`);
+  const st = primaryStation(r);
+  if (!st) return fail(`ride ${id} has no built station to center on`);
   const zoom = num(p, "zoom", 0);
   const rotation = num(p, "rotation", 0);
   doCapture({ x: st.start.x, y: st.start.y }, zoom, rotation, ok);
@@ -489,12 +1275,17 @@ handlers[Methods.CaptureRide] = (p, ok, fail) => {
 
 handlers[Methods.FindLocation] = (p, ok, fail) => {
   const name = str(p, "name").toLowerCase();
-  const matches: Array<{ id: number; name: string; x: number; y: number }> = [];
+  const matches: Array<Record<string, unknown>> = [];
   for (const r of map.rides) {
     if (r.name.toLowerCase().indexOf(name) >= 0) {
-      const st = r.stations && r.stations.length > 0 ? r.stations[0] : null;
-      if (st && st.start) {
-        matches.push({ id: r.id, name: r.name, x: Math.round(st.start.x / TILE), y: Math.round(st.start.y / TILE) });
+      const st = primaryStation(r);
+      if (st) {
+        const c = tileCoords(st.start)!;
+        matches.push({
+          id: r.id, name: r.name, x: c.x, y: c.y,
+          entrance: accessCoords(st.entrance),
+          exit: accessCoords(st.exit),
+        });
       }
     }
   }

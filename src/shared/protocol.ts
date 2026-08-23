@@ -42,6 +42,16 @@ export function fromGameMoney(internal: number): number {
   return internal / MONEY_FACTOR;
 }
 
+/**
+ * Vertical units, matching OpenRCT2's kCoordsZStep / kLandHeightStep. Game
+ * actions take z in world units; tile elements expose that directly as
+ * `baseZ` (their `baseHeight` is the raw height unit, baseZ / COORDS_Z_STEP).
+ * One visible land level is LAND_STEP_Z world units -- also how far a sloped
+ * footpath rises across one tile.
+ */
+export const COORDS_Z_STEP = 8;
+export const LAND_STEP_Z = 16;
+
 /** Method names understood by the plugin dispatcher. Keep in sync with the server tools. */
 export const Methods = {
   // meta / handshake
@@ -70,6 +80,12 @@ export const Methods = {
   FireStaff: "fire_staff",
   SetStaffPatrol: "set_staff_patrol",
   SetLoan: "set_loan",
+  // build: paths
+  InspectArea: "inspect_area",
+  ListPathStyles: "list_path_styles",
+  PlacePath: "place_path",
+  RemovePath: "remove_path",
+  CheckRideAccess: "check_ride_access",
   // vision
   CaptureView: "capture_view",
   CaptureRide: "capture_ride",

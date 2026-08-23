@@ -217,6 +217,63 @@ passthrough("set_loan",
   Methods.SetLoan);
 
 // ===========================================================================
+// 2b. BUILD — footpaths, one tile per call
+// ===========================================================================
+
+passthrough("inspect_area",
+  "Read the map around a tile: an ASCII overview, per-tile ground height, terrain slope, water level, and details of any footpaths / ride entrances. This is how you see terrain height — a screenshot cannot tell you z. Call this before placing paths. groundZ is each tile's low corner and groundTopZ its high corner; they differ wherever groundSlope is non-zero. waterZ is the water level (0 = dry): a tile is only unbuildable when waterZ exceeds groundTopZ, which is what the '~' glyph marks — shoreline tiles keep their ground glyph and can still take a path. Every footpath feature carries `edgeZ`: the world z it presents on each of its four sides (-X, +Y, +X, -Y), or null where a sloped path's mid-slope side cannot connect at all. Two neighbouring paths are walkable between ONLY if the edges they turn to each other are both non-null and exactly equal — compare edgeZ rather than trusting the ASCII map, which draws 'P' on tiles that sit a land level apart and are not connected. A footpath's `edges` bitmask records connections to adjacent PATHS only, not to a ride entrance — to reach a ride, place a path on the tile its entrance faces (get_ride gives the entrance coords and direction).",
+  {
+    x: z.number().int().describe("Center tile X"),
+    y: z.number().int().describe("Center tile Y"),
+    radius: z.number().int().min(0).max(12).optional().describe("Tiles out from center (default 6, max 12)"),
+  },
+  Methods.InspectArea,
+  { map: (a) => ({ x: a.x, y: a.y, radius: a.radius ?? 6 }) });
+
+passthrough("list_path_styles",
+  "List the footpath objects loaded in this park (surface + railings, or legacy paths) with the indices place_path accepts. Call once; place_path picks a sensible default without it.",
+  {}, Methods.ListPathStyles);
+
+passthrough("place_path",
+  "Place ONE footpath tile, following the terrain by default: z defaults to the tile's high corner for a flat path and its low corner for a sloped one, so on flat ground you need only x and y. Pass height_offset to raise it in whole land levels, or z for an exact world z. Omit slope_direction for a flat tile; set it (0-3) to slope the tile upward toward that direction, with z as the LOW end. On sloping ground a flat tile is often rejected with 'Raise or lower land first' — slope the tile to match the terrain instead, checking groundSlope from inspect_area. Errors carry the game's own reason; read it and adjust. Works while the game is paused. Call repeatedly to build a route — and after each call READ THE CONNECTION REPORT before placing the next tile: `connectedTo` lists what this tile actually joined, `neighborsNotConnected` names every neighbouring path or entrance it missed and why, with `connectAtZ` giving the z that would have worked, and `edgeZ` gives the heights this tile now presents on its four sides for the next one to meet. A tile that comes back with an empty `connectedTo` and a `warning` has broken the route: fix it before continuing, because a path one land level off its neighbour looks like a finished route from above and is not walkable. To reach a ride entrance or exit, build on the connectAt tile that get_ride / check_ride_access report — do NOT derive it from the entrance's `direction`, which points into the ride, not out toward the guests.",
+  {
+    x: z.number().int(),
+    y: z.number().int(),
+    z: z.number().int().optional().describe("Exact world z. Omit to sit on the ground at this tile."),
+    height_offset: z.number().int().optional().describe("Land levels above the resolved z (default 0). Use for elevated path."),
+    slope_direction: z.number().int().min(0).max(3).optional().describe("Omit for flat. 0-3 = path rises toward this direction; z is the low end."),
+    queue: z.boolean().optional().describe("Build a queue line instead of a normal path (default false)."),
+    object: z.number().int().optional().describe("Path surface object index from list_path_styles."),
+    railings_object: z.number().int().optional().describe("Railings object index from list_path_styles."),
+  },
+  Methods.PlacePath,
+  { map: (a) => {
+    const o: Record<string, unknown> = { x: a.x, y: a.y };
+    if (a.z !== undefined) o.z = a.z;
+    if (a.height_offset !== undefined) o.height_offset = a.height_offset;
+    if (a.slope_direction !== undefined) o.slope_direction = a.slope_direction;
+    if (a.queue !== undefined) o.queue = a.queue;
+    if (a.object !== undefined) o.object = a.object;
+    if (a.railings_object !== undefined) o.railings_object = a.railings_object;
+    return o;
+  } });
+
+passthrough("check_ride_access",
+  "Check whether guests can actually reach a ride: per station it reports the entrance and exit, the exact tile a footpath must occupy to connect to each (connectAt), and whether a path is there at the right height — plus a flat `problems` list naming what to fix. Use this instead of reading a footpath's `edges`, which only records path-to-path links and never shows a connection to a ride entrance. A ride needs BOTH entrance and exit connected. Stalls have no entrance element and are checked for an adjacent path instead.",
+  { ride_id: z.number().int().describe("Ride or shop id from list_rides / list_shops") },
+  Methods.CheckRideAccess);
+
+passthrough("remove_path",
+  "Remove one footpath tile, for backtracking a bad placement. z is optional when the tile has exactly one path.",
+  {
+    x: z.number().int(),
+    y: z.number().int(),
+    z: z.number().int().optional().describe("World z of the path to remove. Required only if paths are stacked on this tile."),
+  },
+  Methods.RemovePath,
+  { map: (a) => (a.z === undefined ? { x: a.x, y: a.y } : { x: a.x, y: a.y, z: a.z }) });
+
+// ===========================================================================
 // 3. SEE — vision
 // ===========================================================================
 
