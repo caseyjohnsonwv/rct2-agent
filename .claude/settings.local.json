@@ -3,11 +3,12 @@
     "allow": [
       "Read(//mnt/c/**)",
       "Read(//mnt/c/Program Files \\\\\\(x86\\\\\\)/Steam/steamapps/common/**)",
-      "Bash(npm --version)"
+      "Bash(npm --version)",
+      "mcp__rct2-agent__*"
     ]
   },
+  "enableAllProjectMcpServers": true,
   "enabledMcpjsonServers": [
     "rct2-agent"
-  ],
-  "enableAllProjectMcpServers": true
+  ]
 }

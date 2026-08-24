@@ -82,6 +82,7 @@ export const Methods = {
   SetLoan: "set_loan",
   // build: paths
   InspectArea: "inspect_area",
+  GetTileDetail: "get_tile_detail",
   ListPathStyles: "list_path_styles",
   PlacePath: "place_path",
   RemovePath: "remove_path",
@@ -90,6 +91,7 @@ export const Methods = {
   CaptureView: "capture_view",
   CaptureRide: "capture_ride",
   FindLocation: "find_location",
+  FindParkEntrance: "find_park_entrance",
   // time
   GetClock: "get_clock",
   SetGameSpeed: "set_game_speed",

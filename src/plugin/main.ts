@@ -899,7 +899,7 @@ handlers[Methods.SetLoan] = (p, ok, fail) => {
 
 // --- build: paths ----------------------------------------------------------
 
-const MAX_INSPECT_RADIUS = 12;
+const MAX_INSPECT_RADIUS = 24;
 
 handlers[Methods.InspectArea] = (p, ok, fail) => {
   const cx = Math.floor(num(p, "x"));
@@ -916,62 +916,34 @@ handlers[Methods.InspectArea] = (p, ok, fail) => {
   if (x1 < x0 || y1 < y0) return fail(`area around (${cx},${cy}) is outside the map`);
 
   const rows: string[] = [];
-  const ground: number[][] = [];
-  const groundTop: number[][] = [];
-  const slopes: number[][] = [];
-  const waters: number[][] = [];
-  const features: Array<Record<string, unknown>> = [];
+  // Bounded-size overview only: counts stay cheap regardless of how built-out
+  // the area is. Exact heights and full element data are get_tile_detail's job.
+  const counts = { path: 0, queue: 0, entrance: 0, track: 0, scenery: 0, wall: 0, water: 0, unowned: 0 };
 
   for (let y = y0; y <= y1; y++) {
     let row = "";
-    const gz: number[] = [];
-    const gt: number[] = [];
-    const sl: number[] = [];
-    const wz: number[] = [];
     for (let x = x0; x <= x1; x++) {
       const tile = map.getTile(x, y);
       const surf = surfaceOf(tile);
       row += tileGlyph(tile, surf);
-      gz.push(surf ? surf.baseZ : -1);
-      gt.push(surf ? surfaceTopZ(surf) : -1);
-      sl.push(surf ? surf.slope : 0);
-      wz.push(surf ? surf.waterHeight : 0);
+      if (surf && !surf.hasOwnership && !surf.hasConstructionRights) counts.unowned++;
+      if (isSubmerged(surf)) counts.water++;
+      let hasPath = false, hasQueue = false, hasEntrance = false, hasTrack = false, hasScenery = false, hasWall = false;
       for (const el of tile.elements) {
-        if (el.type === "footpath") {
-          const f = el as FootpathElement;
-          features.push({
-            // `edges` covers adjacent footpaths only; a ride entrance next to
-            // this tile does not show up as an edge. edgeZ is the reliable
-            // read: two neighbours connect iff the edges they turn to each
-            // other are both non-null and equal.
-            x, y, type: f.isQueue ? "queue" : "footpath",
-            z: f.baseZ,
-            slopeDirection: f.slopeDirection,
-            edgeZ: edgeZLabelled(f.baseZ, f.slopeDirection),
-            edges: f.edges,
-            ride: f.ride,
-          });
-        } else if (el.type === "entrance") {
-          const e = el as EntranceElement;
-          features.push({
-            x, y, type: "entrance",
-            role: entranceRole(e, x, y),
-            z: e.baseZ,
-            direction: e.direction,
-            ride: e.ride,
-            station: e.station,
-            // Where a path has to go to reach it -- `direction` points into
-            // the ride, so this is the tile on the far side.
-            connectAt: apronTile(x, y, e.baseZ, e.direction),
-          });
-        }
+        if (el.type === "footpath") { hasPath = true; if ((el as FootpathElement).isQueue) hasQueue = true; }
+        else if (el.type === "entrance") hasEntrance = true;
+        else if (el.type === "track") hasTrack = true;
+        else if (el.type === "small_scenery" || el.type === "large_scenery") hasScenery = true;
+        else if (el.type === "wall") hasWall = true;
       }
+      if (hasPath) counts.path++;
+      if (hasQueue) counts.queue++;
+      if (hasEntrance) counts.entrance++;
+      if (hasTrack) counts.track++;
+      if (hasScenery) counts.scenery++;
+      if (hasWall) counts.wall++;
     }
     rows.push(row);
-    ground.push(gz);
-    groundTop.push(gt);
-    slopes.push(sl);
-    waters.push(wz);
   }
 
   ok({
@@ -980,24 +952,163 @@ handlers[Methods.InspectArea] = (p, ok, fail) => {
     // Row-major, rows[0] is y === origin.y; each string is one char per tile.
     map: rows,
     legend: ". empty ground | P path | Q queue | E entrance | T ride/track | s scenery | w wall "
-      + "| ~ under water | lowercase or x = land not owned (cannot build). A tile with waterZ set but "
+      + "| ~ under water | lowercase or x = land not owned (cannot build). A tile with water but "
       + "no ~ is shoreline: its high corner clears the water, so a path can still be built there.",
-    groundZ: ground,
-    groundTopZ: groundTop,
-    groundSlope: slopes,
-    waterZ: waters,
-    features,
+    counts,
+    note: "This is an overview only -- no heights, no per-tile detail. Call get_tile_detail on the "
+      + "specific tiles you're about to inspect or build on for exact ground height/slope/water and "
+      + "the full detail of anything placed there (paths, entrances, track, scenery, walls).",
+  });
+};
+
+/** Resolve an object's display name; null if the index isn't loaded or valid. */
+function objectName(type: ObjectType, index: number): string | null {
+  try {
+    const o = objectManager.getObject(type, index);
+    return o ? o.name : null;
+  } catch (_e) {
+    return null;
+  }
+}
+
+/** Per-element detail for get_tile_detail, one shape per tile element type. */
+function describeElement(el: TileElement, x: number, y: number): Record<string, unknown> {
+  const base = { type: el.type, z: el.baseZ };
+  switch (el.type) {
+    case "footpath": {
+      const f = el as FootpathElement;
+      return {
+        ...base,
+        isQueue: f.isQueue,
+        slopeDirection: f.slopeDirection,
+        // Two neighbouring paths are walkable between ONLY if the edges they
+        // turn to each other are both non-null and exactly equal.
+        edgeZ: edgeZLabelled(f.baseZ, f.slopeDirection),
+        edges: f.edges,
+        ride: f.ride,
+        station: f.station,
+      };
+    }
+    case "entrance": {
+      const e = el as EntranceElement;
+      return {
+        ...base,
+        role: entranceRole(e, x, y),
+        direction: e.direction,
+        ride: e.ride,
+        station: e.station,
+        // Where a path has to go to reach it -- `direction` points into the
+        // ride, so this is the tile on the far side.
+        connectAt: apronTile(x, y, e.baseZ, e.direction),
+      };
+    }
+    case "track": {
+      const t = el as TrackElement;
+      return {
+        ...base,
+        ride: t.ride,
+        trackType: t.trackType,
+        direction: t.direction,
+        station: t.station,
+        hasChainLift: t.hasChainLift,
+        isInverted: t.isInverted,
+      };
+    }
+    case "small_scenery": {
+      const s = el as SmallSceneryElement;
+      return {
+        ...base,
+        object: s.object,
+        name: objectName("small_scenery", s.object),
+        direction: s.direction,
+        quadrant: s.quadrant,
+        colours: [s.primaryColour, s.secondaryColour, s.tertiaryColour],
+      };
+    }
+    case "large_scenery": {
+      const s = el as LargeSceneryElement;
+      return {
+        ...base,
+        object: s.object,
+        name: objectName("large_scenery", s.object),
+        direction: s.direction,
+        sequence: s.sequence,
+        colours: [s.primaryColour, s.secondaryColour, s.tertiaryColour],
+        bannerText: s.bannerText,
+      };
+    }
+    case "wall": {
+      const w = el as WallElement;
+      return {
+        ...base,
+        object: w.object,
+        name: objectName("wall", w.object),
+        direction: w.direction,
+        slope: w.slope,
+        bannerText: w.bannerText,
+      };
+    }
+    case "banner": {
+      const b = el as BannerElement;
+      return {
+        ...base,
+        object: b.object,
+        direction: b.direction,
+        text: b.bannerText,
+        isNoEntry: b.isNoEntry,
+      };
+    }
+    default:
+      return base;
+  }
+}
+
+const MAX_TILE_DETAIL = 40;
+
+handlers[Methods.GetTileDetail] = (p, ok, fail) => {
+  const raw = p.tiles;
+  if (!Array.isArray(raw) || raw.length === 0) return fail("tiles must be a non-empty array of {x,y}");
+  if (raw.length > MAX_TILE_DETAIL) return fail(`too many tiles (${raw.length}); max ${MAX_TILE_DETAIL} per call`);
+
+  const maxX = map.size.x - 1;
+  const maxY = map.size.y - 1;
+
+  const tiles = raw.map((t: any) => {
+    const x = Math.floor(Number(t && t.x));
+    const y = Math.floor(Number(t && t.y));
+    if (!Number.isFinite(x) || !Number.isFinite(y)) return { x: t && t.x, y: t && t.y, error: "invalid coordinates" };
+    if (x < 1 || y < 1 || x > maxX - 1 || y > maxY - 1) return { x, y, error: "outside the map" };
+
+    const tile = map.getTile(x, y);
+    const surf = surfaceOf(tile);
+    const ground = surf
+      ? {
+        z: surf.baseZ,
+        topZ: surfaceTopZ(surf),
+        slope: surf.slope,
+        waterZ: surf.waterHeight,
+        submerged: isSubmerged(surf),
+        owned: surf.hasOwnership || surf.hasConstructionRights,
+      }
+      : null;
+
+    const elements = tile.elements
+      .filter((el) => el.type !== "surface")
+      .map((el) => describeElement(el, x, y));
+
+    return { x, y, ground, elements };
+  });
+
+  ok({
+    tiles,
     zUnits: {
       coordsZStep: COORDS_Z_STEP,
       landStepZ: LAND_STEP_Z,
-      note: "World z. groundZ is a tile's LOW corner, groundTopZ its HIGH corner; "
-        + "they are equal on flat ground (groundSlope 0). A flat path needs z = groundTopZ. "
-        + "A path sloped to match the terrain sits at z = groundZ. Each land level is landStepZ. "
-        + "Each footpath feature carries edgeZ: the world z it presents on each of its four sides "
-        + "(-X, +Y, +X, -Y), or null where a slope's mid-slope side cannot connect at all. Two "
-        + "neighbouring paths are walkable between ONLY if the edges they turn to each other are "
-        + "both non-null and exactly equal -- compare them rather than trusting the ASCII map, "
-        + "which shows 'P' for tiles that are a land level apart and not connected.",
+      note: "World z. ground.z is a tile's LOW corner, ground.topZ its HIGH corner; they are equal "
+        + "on flat ground (slope 0). A flat path needs z = ground.topZ; a path sloped to match the "
+        + "terrain sits at z = ground.z. Each land level is landStepZ. A footpath element's edgeZ is "
+        + "the world z it presents on each of its four sides (-X, +Y, +X, -Y), or null where a "
+        + "slope's mid-slope side cannot connect at all.",
     },
   });
 };
@@ -1291,6 +1402,37 @@ handlers[Methods.FindLocation] = (p, ok, fail) => {
   }
   if (matches.length === 0) return fail(`no ride matching '${name}'`);
   ok({ matches });
+};
+
+handlers[Methods.FindParkEntrance] = (_p, ok, fail) => {
+  // No API exposes park entrance locations directly; the only way to find
+  // one is to scan every tile for an "entrance" element that isn't owned by
+  // a ride (entranceRole falls back to "park" when the ride lookup fails).
+  const maxX = map.size.x - 1;
+  const maxY = map.size.y - 1;
+  const tiles: Array<Record<string, unknown>> = [];
+  for (let y = 1; y < maxY; y++) {
+    for (let x = 1; x < maxX; x++) {
+      for (const el of map.getTile(x, y).elements) {
+        if (el.type !== "entrance") continue;
+        const e = el as EntranceElement;
+        if (entranceRole(e, x, y) !== "park") continue;
+        const connectAt = apronTile(x, y, e.baseZ, e.direction);
+        tiles.push({
+          x, y, z: e.baseZ, direction: e.direction, sequence: e.sequence,
+          connectAt,
+          access: apronStatus(connectAt),
+        });
+      }
+    }
+  }
+  if (tiles.length === 0) return fail("no park entrance found on the map -- it may not be built yet");
+  ok({
+    tiles,
+    note: "A park entrance spans three tiles (sequence 0-2 across one row); only the "
+      + "walkable centre tile needs a path connected outside it at connectAt -- `access` "
+      + "reports whether one is there. Use capture_view on any of these coordinates to see it.",
+  });
 };
 
 // --- time ------------------------------------------------------------------

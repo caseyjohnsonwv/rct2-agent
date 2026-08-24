@@ -221,21 +221,30 @@ passthrough("set_loan",
 // ===========================================================================
 
 passthrough("inspect_area",
-  "Read the map around a tile: an ASCII overview, per-tile ground height, terrain slope, water level, and details of any footpaths / ride entrances. This is how you see terrain height — a screenshot cannot tell you z. Call this before placing paths. groundZ is each tile's low corner and groundTopZ its high corner; they differ wherever groundSlope is non-zero. waterZ is the water level (0 = dry): a tile is only unbuildable when waterZ exceeds groundTopZ, which is what the '~' glyph marks — shoreline tiles keep their ground glyph and can still take a path. Every footpath feature carries `edgeZ`: the world z it presents on each of its four sides (-X, +Y, +X, -Y), or null where a sloped path's mid-slope side cannot connect at all. Two neighbouring paths are walkable between ONLY if the edges they turn to each other are both non-null and exactly equal — compare edgeZ rather than trusting the ASCII map, which draws 'P' on tiles that sit a land level apart and are not connected. A footpath's `edges` bitmask records connections to adjacent PATHS only, not to a ride entrance — to reach a ride, place a path on the tile its entrance faces (get_ride gives the entrance coords and direction).",
+  "Get a cheap ASCII overview of the map around a tile, plus counts of what's out there (paths, queues, entrances, track, scenery, walls, water, unowned land). This is how you see terrain at a glance and decide where to look closer — a screenshot cannot tell you z, and this tool doesn't give you z either. It carries no per-tile height or element detail on purpose, so a wide radius stays cheap: call get_tile_detail on the specific tiles you're about to inspect or build on for exact ground height/slope/water and the full detail of anything placed there.",
   {
     x: z.number().int().describe("Center tile X"),
     y: z.number().int().describe("Center tile Y"),
-    radius: z.number().int().min(0).max(12).optional().describe("Tiles out from center (default 6, max 12)"),
+    radius: z.number().int().min(0).max(24).optional().describe("Tiles out from center (default 6, max 24)"),
   },
   Methods.InspectArea,
   { map: (a) => ({ x: a.x, y: a.y, radius: a.radius ?? 6 }) });
+
+passthrough("get_tile_detail",
+  "Get exact per-tile detail for a small, explicit list of tiles: ground height (low corner `z` and high corner `topZ`), slope, water level, ownership, and full detail of every element placed there — footpaths (with `edgeZ`, the world z each of the tile's four sides presents; two neighbouring paths are walkable between ONLY if the edges they turn to each other are both non-null and exactly equal), ride entrances/exits (with `connectAt`, the tile a path has to sit on to reach them — `direction` points INTO the ride, not out toward guests), track, small/large scenery, walls, and banners, each with its object name. Call this on the handful of tiles you're actually about to act on (found via inspect_area, get_ride, or check_ride_access) rather than sweeping a whole area — cost scales with tiles requested, not map size.",
+  {
+    tiles: z.array(z.object({ x: z.number().int(), y: z.number().int() })).min(1).max(40)
+      .describe("Tiles to inspect, up to 40 per call."),
+  },
+  Methods.GetTileDetail,
+  { map: (a) => ({ tiles: a.tiles }) });
 
 passthrough("list_path_styles",
   "List the footpath objects loaded in this park (surface + railings, or legacy paths) with the indices place_path accepts. Call once; place_path picks a sensible default without it.",
   {}, Methods.ListPathStyles);
 
 passthrough("place_path",
-  "Place ONE footpath tile, following the terrain by default: z defaults to the tile's high corner for a flat path and its low corner for a sloped one, so on flat ground you need only x and y. Pass height_offset to raise it in whole land levels, or z for an exact world z. Omit slope_direction for a flat tile; set it (0-3) to slope the tile upward toward that direction, with z as the LOW end. On sloping ground a flat tile is often rejected with 'Raise or lower land first' — slope the tile to match the terrain instead, checking groundSlope from inspect_area. Errors carry the game's own reason; read it and adjust. Works while the game is paused. Call repeatedly to build a route — and after each call READ THE CONNECTION REPORT before placing the next tile: `connectedTo` lists what this tile actually joined, `neighborsNotConnected` names every neighbouring path or entrance it missed and why, with `connectAtZ` giving the z that would have worked, and `edgeZ` gives the heights this tile now presents on its four sides for the next one to meet. A tile that comes back with an empty `connectedTo` and a `warning` has broken the route: fix it before continuing, because a path one land level off its neighbour looks like a finished route from above and is not walkable. To reach a ride entrance or exit, build on the connectAt tile that get_ride / check_ride_access report — do NOT derive it from the entrance's `direction`, which points into the ride, not out toward the guests.",
+  "Place ONE footpath tile, following the terrain by default: z defaults to the tile's high corner for a flat path and its low corner for a sloped one, so on flat ground you need only x and y. Pass height_offset to raise it in whole land levels, or z for an exact world z. Omit slope_direction for a flat tile; set it (0-3) to slope the tile upward toward that direction, with z as the LOW end. On sloping ground a flat tile is often rejected with 'Raise or lower land first' — slope the tile to match the terrain instead, checking the tile's slope via get_tile_detail. Errors carry the game's own reason; read it and adjust. Works while the game is paused. Call repeatedly to build a route — and after each call READ THE CONNECTION REPORT before placing the next tile: `connectedTo` lists what this tile actually joined, `neighborsNotConnected` names every neighbouring path or entrance it missed and why, with `connectAtZ` giving the z that would have worked, and `edgeZ` gives the heights this tile now presents on its four sides for the next one to meet. A tile that comes back with an empty `connectedTo` and a `warning` has broken the route: fix it before continuing, because a path one land level off its neighbour looks like a finished route from above and is not walkable. To reach a ride entrance or exit, build on the connectAt tile that get_ride / check_ride_access report — do NOT derive it from the entrance's `direction`, which points into the ride, not out toward the guests.",
   {
     x: z.number().int(),
     y: z.number().int(),
@@ -305,6 +314,13 @@ passthrough("find_location",
   "Find tile coordinates for a named ride (substring match). Use the result with capture_view.",
   { name: z.string() },
   Methods.FindLocation);
+
+passthrough("find_park_entrance",
+  "Locate the park entrance by scanning the map. Returns each of its three tiles (sequence "
+  + "0-2), with connectAt (the tile a footpath must occupy to reach the walkable centre tile) "
+  + "and whether a path is already connected there.",
+  {},
+  Methods.FindParkEntrance);
 
 // ===========================================================================
 // 4. CONTROL TIME
