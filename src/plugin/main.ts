@@ -72,6 +72,23 @@ function execAction(action: ActionType, args: object): Promise<GameActionResult>
   });
 }
 
+/**
+ * Ask the game whether an action would be allowed, without doing it. Query
+ * results carry the game's own refusal text, which is far more useful to the
+ * caller than anything we could infer about why a tile is unbuildable.
+ */
+function queryAction(action: ActionType, args: object): Promise<GameActionResult> {
+  return new Promise((resolve, reject) => {
+    context.queryAction(action as any, args as any, (res: GameActionResult) => {
+      if (res.error && res.error !== 0) {
+        reject(new Error(res.errorMessage || res.errorTitle || `action ${action} refused (code ${res.error})`));
+      } else {
+        resolve(res);
+      }
+    });
+  });
+}
+
 function clockInfo() {
   const d = date;
   const monthNames = [
@@ -584,6 +601,159 @@ function rideDetail(r: Ride) {
     })),
   };
 }
+
+// --- shops & facilities ----------------------------------------------------
+
+/**
+ * Every stall and facility -- burger bar, drink stall, souvenir shop, toilets,
+ * first aid, cash machine, information kiosk -- is the same single 1x1 flat
+ * track piece, so building one is always ridecreate + one trackplace.
+ *
+ * TrackElemType::FlatTrack1x1A is 262 in current OpenRCT2; 118 is the SV6/TD6
+ * alias older builds use for the same piece. Ask the running game which
+ * numbering it speaks rather than assuming.
+ */
+const SHOP_TRACK_TYPE_MODERN = 262;
+const SHOP_TRACK_TYPE_LEGACY = 118;
+let shopTrackTypeCache: number | null = null;
+function shopTrackType(): number {
+  if (shopTrackTypeCache === null) {
+    shopTrackTypeCache = context.getTrackSegment(SHOP_TRACK_TYPE_MODERN) !== null
+      ? SHOP_TRACK_TYPE_MODERN
+      : SHOP_TRACK_TYPE_LEGACY;
+  }
+  return shopTrackTypeCache;
+}
+
+/**
+ * RCT2 ride type ids for stalls and facilities, fixed by the original game.
+ * Facilities are in here alongside the stalls on purpose: toilets, first aid,
+ * the cash machine and the information kiosk are built exactly like a food
+ * stall and differ only in what they hand the guest.
+ */
+const SHOP_TYPE_LABEL: Record<number, string> = {
+  28: "food stall",
+  30: "drink stall",
+  32: "souvenir shop",
+  35: "information kiosk",
+  36: "toilets",
+  45: "cash machine",
+  48: "first aid",
+};
+/** Which of those the game reports as classification "facility" rather than "stall". */
+const FACILITY_RIDE_TYPES = [35, 36, 45, 48];
+
+/**
+ * The ride types this park treats as shops. Starts from the RCT2 set above and
+ * folds in any ride type the scenario's own research files under "shop", so a
+ * park carrying custom objects is described by the game rather than by our
+ * table. Research is missing in some scenarios; the table alone is then fine.
+ */
+function shopRideTypes(): number[] {
+  const out: number[] = [];
+  for (const k in SHOP_TYPE_LABEL) out.push(Number(k));
+  try {
+    const fold = (items: ResearchItem[]) => {
+      for (const it of items || []) {
+        if (it.type === "ride" && it.category === "shop" && out.indexOf(it.rideType) < 0) {
+          out.push(it.rideType);
+        }
+      }
+    };
+    fold(park.research.inventedItems);
+    fold(park.research.uninventedItems);
+  } catch (_e) {
+    /* no research in this scenario */
+  }
+  return out;
+}
+
+/**
+ * The shop ride type a ride object provides, or undefined if it is a real ride.
+ * An object advertises up to three ride types, with unused slots left at 255.
+ */
+function shopRideTypeOf(o: RideObject, types: number[]): number | undefined {
+  for (const t of o.rideType || []) {
+    if (types.indexOf(t) >= 0) return t;
+  }
+  return undefined;
+}
+
+function isResearched(objectIndex: number): boolean {
+  try {
+    return park.research.isObjectResearched("ride", objectIndex);
+  } catch (_e) {
+    // No research data means nothing is gated; treat everything as available.
+    return true;
+  }
+}
+
+/**
+ * Where a stall or facility takes its customers from.
+ *
+ * A stall has no entrance element of its own: guests step in from the
+ * neighbouring tile on the side the stall faces, at the stall's own height.
+ * The engine records that side twice -- as a station entrance where it sets
+ * one, and as the track element's rotation -- so read the station first and
+ * fall back to the rotation. All four neighbours come back regardless, because
+ * the quickest fix for an unreachable stall is usually to see which side does
+ * have a path and turn the stall toward it.
+ */
+function shopAccess(r: Ride) {
+  const st = primaryStation(r);
+  const here = st ? tileCoords(st.start) : null;
+  if (!here || here.z === undefined) return null;
+  const z = here.z;
+
+  let facing: number | null = null;
+  for (const el of map.getTile(here.x, here.y).elements) {
+    if (el.type === "track" && (el as TrackElement).ride === r.id) {
+      facing = (el as TrackElement).direction & 3;
+      break;
+    }
+  }
+
+  let entranceTile: { x: number; y: number; z: number } | null = null;
+  let entranceFrom = "";
+  const en = st ? accessCoords(st.entrance) : null;
+  if (en && en.connectAt) {
+    entranceTile = en.connectAt;
+    entranceFrom = "station entrance";
+  } else if (facing !== null) {
+    const d = DIRECTION_DELTA[facing];
+    entranceTile = { x: here.x + d.dx, y: here.y + d.dy, z };
+    entranceFrom = "stall rotation";
+  }
+
+  const adjacent = DIRECTION_DELTA.map((d, direction) => {
+    const a = { x: here.x + d.dx, y: here.y + d.dy, z };
+    const isEntrance = !!entranceTile && entranceTile.x === a.x && entranceTile.y === a.y;
+    return { direction, side: DIRECTION_LABEL[direction], x: a.x, y: a.y, isEntranceSide: isEntrance, ...apronStatus(a) };
+  });
+
+  const entrance = entranceTile ? apronStatus(entranceTile) : null;
+  const otherSideHasPath = adjacent.some((a) => !a.isEntranceSide && a.connected);
+
+  return {
+    tile: { x: here.x, y: here.y, z },
+    faces: facing,
+    facesSide: facing === null ? null : DIRECTION_LABEL[facing],
+    entranceTile,
+    entranceFrom,
+    entrance,
+    adjacent,
+    connected: entrance ? entrance.connected : adjacent.some((a) => a.connected),
+    otherSideHasPath,
+  };
+}
+
+/** The one-line explanation of stall access, kept identical everywhere it is said. */
+const SHOP_ACCESS_NOTE =
+  "A stall or facility has no entrance element: guests use it from the single "
+  + "neighbouring tile it faces, at the stall's own z. entranceTile is that tile "
+  + "-- put a footpath there. If the wrong side is facing the path, remove_shop "
+  + "and build_shop again with the right direction; there is no rotate action. "
+  + "adjacent lists all four sides so you can see which one the path is actually on.";
 
 // ---------------------------------------------------------------------------
 // handlers
@@ -1255,7 +1425,9 @@ handlers[Methods.RemovePath] = (p, ok, fail) => {
   execAction("footpathremove", { x: x * TILE, y: y * TILE, z })
     .then((res: GameActionResult) => {
       restore();
-      ok({ removed: true, x, y, z, refund: dollars(res.cost || 0) });
+      // A demolish reports its cost as negative -- money coming back. Say that
+      // as a positive refund rather than making the caller flip the sign.
+      ok({ removed: true, x, y, z, refund: dollars(-(res.cost || 0)) });
     })
     .catch((e) => {
       restore();
@@ -1275,32 +1447,39 @@ handlers[Methods.CheckRideAccess] = (p, ok, fail) => {
 
   const problems: string[] = [];
 
-  // Stalls and facilities have no entrance element at all: a guest uses one
-  // from any adjacent footpath at the same height.
+  // Stalls and facilities have no entrance element: guests use one from the
+  // single neighbouring tile it faces, so which way it was built matters.
   if (isShop(r)) {
-    const st = primaryStation(r);
-    const here = st ? tileCoords(st.start) : null;
-    if (!here || here.z === undefined) return fail(`shop ${id} has no placed tile to check`);
-    const adjacent = DIRECTION_DELTA.map((d, direction) => {
-      const a = { x: here.x + d.dx, y: here.y + d.dy, z: here.z as number };
-      const res = apronStatus(a);
-      return { direction, x: a.x, y: a.y, ...res };
-    });
-    const reachable = adjacent.filter((a) => a.connected);
-    if (reachable.length === 0) {
+    const access = shopAccess(r);
+    if (!access) return fail(`shop ${id} has no placed tile to check`);
+
+    if (!access.entranceTile) {
+      problems.push(`${r.name} is placed but its facing could not be read; check it in-game`);
+    } else if (access.entrance && !access.entrance.connected) {
       problems.push(
-        `${r.name} has no adjacent footpath at z=${here.z}; guests cannot reach it. `
-        + adjacent.map((a) => `(${a.x},${a.y}): ${a.detail}`).join(" | "),
+        `${r.name} faces ${access.facesSide} and needs a footpath at `
+        + `(${access.entranceTile.x},${access.entranceTile.y}) z=${access.entranceTile.z}: ${access.entrance.detail}`,
       );
+      if (access.otherSideHasPath) {
+        problems.push(
+          `a path does reach one of ${r.name}'s other sides, but guests can only use the side it faces `
+          + "-- rebuild it turned toward the path, or path the tile it faces",
+        );
+      }
     }
+
     return ok({
       rideId: r.id, name: r.name, classification: r.classification, status: r.status,
-      connected: reachable.length > 0,
-      tile: here,
-      adjacent,
+      connected: access.connected,
+      tile: access.tile,
+      faces: access.faces,
+      facesSide: access.facesSide,
+      facingReadFrom: access.entranceFrom,
+      entranceTile: access.entranceTile,
+      entrance: access.entrance,
+      adjacent: access.adjacent,
       problems,
-      note: "Stalls have no entrance or exit element; a guest can use one from any "
-        + "adjacent footpath at the same height.",
+      note: SHOP_ACCESS_NOTE,
     });
   }
 
@@ -1343,6 +1522,231 @@ handlers[Methods.CheckRideAccess] = (p, ok, fail) => {
       + "-- build there, at the z given. Guests need BOTH the entrance and the exit "
       + "connected before a ride works.",
   });
+};
+
+// --- build: shops & facilities ---------------------------------------------
+
+handlers[Methods.ListShopTypes] = (p, ok) => {
+  const includeUnresearched = bool(p, "include_unresearched", false);
+  const types = shopRideTypes();
+  const all = objectManager.getAllObjects("ride") || [];
+
+  const available: Array<Record<string, unknown>> = [];
+  const locked: Array<Record<string, unknown>> = [];
+  for (const o of all) {
+    const rideType = shopRideTypeOf(o, types);
+    if (rideType === undefined) continue;
+    const researched = isResearched(o.index);
+    const entry = {
+      object: o.index,
+      name: o.name,
+      identifier: o.identifier,
+      rideType,
+      kind: SHOP_TYPE_LABEL[rideType] || "shop",
+      classification: FACILITY_RIDE_TYPES.indexOf(rideType) >= 0 ? "facility" : "stall",
+    };
+    if (researched) available.push(entry);
+    else locked.push(entry);
+  }
+
+  ok({
+    count: available.length,
+    shopTypes: available,
+    ...(includeUnresearched
+      ? { lockedCount: locked.length, locked }
+      : locked.length > 0
+        ? { lockedCount: locked.length, note2: `${locked.length} more are loaded but not yet researched; pass include_unresearched to see them` }
+        : {}),
+    note: "Pass `object` to build_shop. Facilities (toilets, first aid, cash machine, "
+      + "information kiosk) build exactly like stalls -- they are in this list too. "
+      + "A new shop opens closed and priced at 0: use set_shop_price and open_ride after building.",
+  });
+};
+
+handlers[Methods.BuildShop] = (p, ok, fail) => {
+  const x = Math.floor(num(p, "x"));
+  const y = Math.floor(num(p, "y"));
+  const objectIndex = Math.floor(num(p, "object"));
+  const name = p.name === undefined || p.name === null ? null : str(p, "name");
+
+  let obj: RideObject | null = null;
+  try {
+    obj = objectManager.getObject("ride", objectIndex);
+  } catch (_e) {
+    obj = null;
+  }
+  if (!obj) return fail(`no ride object with index ${objectIndex}; call list_shop_types for the indices this park has`);
+  const types = shopRideTypes();
+  const rideType = shopRideTypeOf(obj, types);
+  if (rideType === undefined) {
+    return fail(`"${obj.name}" (object ${objectIndex}) is a ride, not a stall or facility; build_shop only builds shops`);
+  }
+  if (!isResearched(objectIndex)) {
+    return fail(`"${obj.name}" has not been researched yet and cannot be built`);
+  }
+
+  // Pre-flight the tile before creating anything. ridecreate allocates a ride
+  // slot the moment it succeeds, so every check we can make first is one less
+  // way to strand an empty shop in the ride list.
+  const tile = map.getTile(x, y);
+  const surf = surfaceOf(tile);
+  if (!surf) return fail(`no ground at tile (${x},${y}); is it outside the map?`);
+  if (!surf.hasOwnership && !surf.hasConstructionRights) {
+    return fail(`land at (${x},${y}) is not owned; a shop cannot be built there`);
+  }
+
+  const topZ = surfaceTopZ(surf);
+  const baseZ = p.z !== undefined ? num(p, "z") : topZ;
+  const z = baseZ + Math.floor(num(p, "height_offset", 0)) * LAND_STEP_Z;
+  if (z < 0) return fail(`resolved z ${z} is below ground level`);
+
+  // A stall's entrance is the side it faces, so direction is not cosmetic. The
+  // game's own placement UI spins a stall toward an adjacent path; do the same
+  // when the caller doesn't say, which makes "path first, then shop" need only
+  // x, y and object.
+  const explicit = p.direction !== undefined && p.direction !== null;
+  let direction = explicit ? (Math.floor(num(p, "direction")) & 3) : 0;
+  let facedExistingPath = false;
+  if (!explicit) {
+    for (let d = 0; d < 4; d++) {
+      const n = DIRECTION_DELTA[d];
+      if (apronStatus({ x: x + n.dx, y: y + n.dy, z }).connected) {
+        direction = d;
+        facedExistingPath = true;
+        break;
+      }
+    }
+  }
+
+  const trackArgs = {
+    x: x * TILE,
+    y: y * TILE,
+    z,
+    direction: direction as Direction,
+    ride: 0, // filled in once the ride exists
+    trackType: shopTrackType(),
+    rideType,
+    brakeSpeed: 0,
+    colour: 0,
+    seatRotation: 4,
+    trackPlaceFlags: 0,
+    isFromTrackDesign: false,
+  };
+
+  const restore = unpauseFor();
+  let rideId = -1;
+  let nameError: string | null = null;
+
+  execAction("ridecreate", {
+    rideType,
+    rideObject: objectIndex,
+    entranceObject: 0,
+    colour1: 0,
+    colour2: 0,
+    inspectionInterval: 0,
+  })
+    .then((created: GameActionResult) => {
+      const id = (created as RideCreateActionResult).ride;
+      if (id === undefined || id === null) throw new Error("the game created the ride but reported no id");
+      rideId = id;
+      trackArgs.ride = id;
+      // Query first so a refusal reports the game's own reason, then place.
+      return queryAction("trackplace", trackArgs)
+        .then(() => execAction("trackplace", trackArgs))
+        .catch((e) =>
+          // The ride slot is already allocated. A shop that never got its tile
+          // would sit in the ride list forever and count against the ride
+          // limit, so hand it back before reporting the failure.
+          execAction("ridedemolish", { ride: id, modifyType: 0 })
+            .catch(() => undefined)
+            .then(() => { throw e; }),
+        );
+    })
+    .then((placed: GameActionResult) => {
+      const cost = dollars(placed.cost || 0);
+      if (name === null) return cost;
+      // A rejected rename is not worth throwing away a built shop over; say so
+      // and let the caller retry it.
+      return execAction("ridesetname", { ride: rideId, name })
+        .then(() => cost)
+        .catch((e) => { nameError = String(e.message || e); return cost; });
+    })
+    .then((cost: number) => {
+      restore();
+      let r: Ride | null = null;
+      try {
+        r = map.getRide(rideId);
+      } catch (_e) {
+        r = null;
+      }
+      const access = r ? shopAccess(r) : null;
+      ok({
+        built: true,
+        rideId,
+        name: r ? r.name : name,
+        object: objectIndex,
+        objectName: obj.name,
+        rideType,
+        kind: SHOP_TYPE_LABEL[rideType] || "shop",
+        classification: r ? r.classification : null,
+        x, y, z,
+        groundTopZ: topZ,
+        direction,
+        facesSide: DIRECTION_LABEL[direction],
+        directionChosen: explicit ? "given" : facedExistingPath ? "turned toward an adjacent path" : "defaulted (no adjacent path to face)",
+        cost,
+        status: r ? r.status : null,
+        ...(access ? { entranceTile: access.entranceTile, entrance: access.entrance, adjacent: access.adjacent, connected: access.connected } : {}),
+        ...(access && !access.connected
+          ? {
+            warning: access.otherSideHasPath
+              ? `no path on the side this shop faces (${DIRECTION_LABEL[direction]}), but one of the other sides has one. `
+                + "Guests cannot reach it: either path the tile in entranceTile, or remove_shop and build_shop again "
+                + "with direction set to the side the path is on."
+              : "nothing reaches this shop yet. Place a footpath on entranceTile at the z given; "
+                + "expected if you are building the shop before the path.",
+          }
+          : {}),
+        ...(nameError ? { nameError: `the shop was built but renaming failed: ${nameError}` } : {}),
+        note: "A new shop is CLOSED and priced at 0. Call set_shop_price then open_ride. " + SHOP_ACCESS_NOTE,
+      });
+    })
+    .catch((e) => {
+      restore();
+      fail(`build_shop "${obj ? obj.name : objectIndex}" at (${x},${y}) z=${z}: ${String(e.message || e)}`);
+    });
+};
+
+handlers[Methods.RemoveShop] = (p, ok, fail) => {
+  const id = num(p, "ride_id");
+  let r: Ride | null = null;
+  try {
+    r = map.getRide(id);
+  } catch (_e) {
+    r = null;
+  }
+  if (!r) return fail(`no ride with id ${id}`);
+  if (!isShop(r)) {
+    return fail(`ride ${id} ("${r.name}") is a ${r.classification}, not a stall or facility; remove_shop only removes shops`);
+  }
+  // Read what we want to report before the ride stops existing.
+  const name = r.name;
+  const classification = r.classification;
+  const st = primaryStation(r);
+  const where = st ? tileCoords(st.start) : null;
+
+  const restore = unpauseFor();
+  // One action: demolishing the ride takes its tile with it.
+  execAction("ridedemolish", { ride: id, modifyType: 0 })
+    .then((res: GameActionResult) => {
+      restore();
+      // Negative cost is money coming back; report it as a positive refund.
+      ok({ removed: true, rideId: id, name, classification, tile: where, refund: dollars(-(res.cost || 0)) });
+    })
+    .catch((e) => {
+      restore();
+      fail(`remove_shop ${id} ("${name}"): ${String(e.message || e)}`);
+    });
 };
 
 // --- vision ----------------------------------------------------------------

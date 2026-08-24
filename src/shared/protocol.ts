@@ -87,6 +87,10 @@ export const Methods = {
   PlacePath: "place_path",
   RemovePath: "remove_path",
   CheckRideAccess: "check_ride_access",
+  // build: shops & facilities
+  ListShopTypes: "list_shop_types",
+  BuildShop: "build_shop",
+  RemoveShop: "remove_shop",
   // vision
   CaptureView: "capture_view",
   CaptureRide: "capture_ride",

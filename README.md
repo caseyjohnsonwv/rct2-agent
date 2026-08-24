@@ -2,8 +2,12 @@
 
 An MCP server + OpenRCT2 plugin that lets an agent **sidecar-manage** your park
 while you play: read the state, act on the business (prices, staff, marketing,
-loans), see the park (screenshots), and control time. Management only — the
-agent tunes the business and can *recommend* building, but never builds.
+loans), lay footpaths and put up shops, see the park (screenshots), and control
+time.
+
+Building is deliberately narrow. The agent can place **footpaths** and **stalls
+and facilities** — the things a park needs a lot of and that fit on one tile.
+Rides are still hands-off: it can recommend one, but not build it.
 
 ## How it fits together
 
@@ -75,11 +79,18 @@ claude mcp add rct2-agent --scope project \
 `list_staff`, `get_scenario`
 
 **Act (hands):** `set_ride_price`, `set_shop_price`, `set_park_entry_fee`,
-`open_ride`, `close_ride`, `set_inspection_interval`,
+`set_park_open`, `open_ride`, `close_ride`, `set_inspection_interval`,
 `start_marketing_campaign`, `set_research_funding`, `hire_staff`, `fire_staff`,
 `set_staff_patrol`, `set_loan`
 
-**See (vision):** `capture_view`, `capture_ride`, `find_location`
+**Build — survey:** `inspect_area`, `get_tile_detail`, `check_ride_access`
+
+**Build — footpaths:** `list_path_styles`, `place_path`, `remove_path`
+
+**Build — shops & facilities:** `list_shop_types`, `build_shop`, `remove_shop`
+
+**See (vision):** `capture_view`, `capture_ride`, `find_location`,
+`find_park_entrance`
 
 **Time:** `get_clock`, `set_game_speed`, `pause`, `resume`, `advance_days`
 
@@ -101,6 +112,22 @@ claude mcp add rct2-agent --scope project \
   a park.
 - **Writes go through game actions**, so the game's own limits apply (e.g. the
   ride price cap). A rejected action comes back as a tool error.
+- **Paths are one tile per call.** `place_path` reports what the new tile
+  actually connected to and, more usefully, which neighbours it *missed* and by
+  how much — a path one land level off its neighbour looks like a finished route
+  from above and is not walkable.
+- **Shops are entered from one side.** A stall or facility has no entrance
+  element; guests use it from the single neighbouring tile it faces. `build_shop`
+  turns the shop toward an adjacent path automatically, so building the path
+  first is the easy order. Build it the other way round and you must pass
+  `direction` yourself — there is no rotate action, so a shop facing the wrong
+  way has to be removed and rebuilt. `check_ride_access` reports the facing side
+  for shops and all four neighbours, so a mistake is visible.
+- **Facilities are shops here.** Toilets, first aid, the cash machine and the
+  information kiosk build exactly like a food stall and go through the same
+  `list_shop_types` / `build_shop` / `remove_shop` tools.
+- **A new shop opens closed and priced at 0** — `build_shop` says so in its
+  result. Follow up with `set_shop_price` and `open_ride`.
 
 ## Dev
 

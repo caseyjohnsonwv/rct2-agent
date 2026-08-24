@@ -268,7 +268,7 @@ passthrough("place_path",
   } });
 
 passthrough("check_ride_access",
-  "Check whether guests can actually reach a ride: per station it reports the entrance and exit, the exact tile a footpath must occupy to connect to each (connectAt), and whether a path is there at the right height — plus a flat `problems` list naming what to fix. Use this instead of reading a footpath's `edges`, which only records path-to-path links and never shows a connection to a ride entrance. A ride needs BOTH entrance and exit connected. Stalls have no entrance element and are checked for an adjacent path instead.",
+  "Check whether guests can actually reach a ride: per station it reports the entrance and exit, the exact tile a footpath must occupy to connect to each (connectAt), and whether a path is there at the right height — plus a flat `problems` list naming what to fix. Use this instead of reading a footpath's `edges`, which only records path-to-path links and never shows a connection to a ride entrance. A ride needs BOTH entrance and exit connected. Stalls and facilities have no entrance element: they are checked against the one side the shop faces, reported as `entranceTile`, with every neighbouring side listed so a shop built facing the wrong way is obvious.",
   { ride_id: z.number().int().describe("Ride or shop id from list_rides / list_shops") },
   Methods.CheckRideAccess);
 
@@ -281,6 +281,49 @@ passthrough("remove_path",
   },
   Methods.RemovePath,
   { map: (a) => (a.z === undefined ? { x: a.x, y: a.y } : { x: a.x, y: a.y, z: a.z }) });
+
+// ===========================================================================
+// 2c. BUILD — shops & facilities
+// ===========================================================================
+
+passthrough("list_shop_types",
+  "List the stalls and facilities this park can build, with the `object` index build_shop takes. Covers BOTH stalls (food, drink, souvenirs) and facilities (toilets, first aid, cash machine, information kiosk) — they build identically and are all in this list. Only researched types are returned by default; the rest are loaded but not yet unlocked.",
+  {
+    include_unresearched: z.boolean().optional()
+      .describe("Also list types that are loaded but not yet researched (default false). They cannot be built until research unlocks them."),
+  },
+  Methods.ListShopTypes,
+  { map: (a) => (a.include_unresearched === undefined ? {} : { include_unresearched: a.include_unresearched }) });
+
+passthrough("build_shop",
+  "Build ONE stall or facility on a single tile — food and drink stalls, souvenir shops, toilets, first aid, cash machines, information kiosks. z defaults to the tile's high corner, so on flat owned ground you need only x, y and object. "
+  + "A shop is entered from the ONE side it faces, not from any neighbour: omit `direction` and it is turned toward an adjacent path automatically (build the path first and this is always right), or pass 0-3 to force a side when the path comes later. The result reports `entranceTile` — the tile a footpath must occupy, at the z given — plus every neighbouring side's path status, and warns when nothing reaches it. "
+  + "There is no rotate action: a shop facing the wrong way has to be removed and rebuilt. "
+  + "A new shop is CLOSED and priced at 0 — follow up with set_shop_price and open_ride, or it earns nothing. Errors carry the game's own reason; read it and adjust.",
+  {
+    x: z.number().int(),
+    y: z.number().int(),
+    object: z.number().int().describe("Shop object index from list_shop_types."),
+    direction: z.number().int().min(0).max(3).optional()
+      .describe("Side the shop faces and takes customers from: 0=-X, 1=+Y, 2=+X, 3=-Y. Omit to face an adjacent path automatically."),
+    z: z.number().int().optional().describe("Exact world z. Omit to sit on the ground at this tile."),
+    height_offset: z.number().int().optional().describe("Land levels above the resolved z (default 0)."),
+    name: z.string().optional().describe("Custom name for the shop. Omit for the game's default."),
+  },
+  Methods.BuildShop,
+  { map: (a) => {
+    const o: Record<string, unknown> = { x: a.x, y: a.y, object: a.object };
+    if (a.direction !== undefined) o.direction = a.direction;
+    if (a.z !== undefined) o.z = a.z;
+    if (a.height_offset !== undefined) o.height_offset = a.height_offset;
+    if (a.name !== undefined) o.name = a.name;
+    return o;
+  } });
+
+passthrough("remove_shop",
+  "Demolish one stall or facility and refund what the game gives back. Takes the tile with it — no separate track removal. Use this to back out a bad placement, or to rebuild a shop facing a different direction. Rides are not accepted; this only removes shops.",
+  { ride_id: z.number().int().describe("Shop id from list_shops or build_shop") },
+  Methods.RemoveShop);
 
 // ===========================================================================
 // 3. SEE — vision
