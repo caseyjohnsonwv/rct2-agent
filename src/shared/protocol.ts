@@ -91,6 +91,11 @@ export const Methods = {
   ListShopTypes: "list_shop_types",
   BuildShop: "build_shop",
   RemoveShop: "remove_shop",
+  // build: rides
+  ListRideTypes: "list_ride_types",
+  BuildRide: "build_ride",
+  RemoveRide: "remove_ride",
+  BuildRideEntrance: "build_ride_entrance",
   // vision
   CaptureView: "capture_view",
   CaptureRide: "capture_ride",

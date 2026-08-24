@@ -38,6 +38,18 @@ function money(dollars: number): number {
 function dollars(internal: number): number {
   return Math.round((internal / MONEY_FACTOR) * 100) / 100;
 }
+/**
+ * Money the game has not worked out yet comes back as its "undefined money"
+ * sentinel (INT64_MIN), which renders as -922337203685477600 and reads like a
+ * catastrophic loss. A brand new ride reports its income that way until the
+ * first hour of operation. Anything that far negative is the sentinel, not a
+ * balance, so say null.
+ */
+const MONEY_UNDEFINED_FLOOR = -1e15;
+function dollarsOrNull(internal: number): number | null {
+  if (typeof internal !== "number" || internal <= MONEY_UNDEFINED_FLOOR) return null;
+  return dollars(internal);
+}
 function rating2dp(v: number): number {
   return Math.round(v) / 100;
 }
@@ -545,8 +557,8 @@ function rideSummary(r: Ride) {
     intensity: r.intensity >= 0 ? rating2dp(r.intensity) : null,
     nausea: r.nausea >= 0 ? rating2dp(r.nausea) : null,
     queueTimeMinutes: queueTime,
-    incomePerHour: dollars(r.incomePerHour),
-    totalProfit: dollars(r.totalProfit),
+    incomePerHour: dollarsOrNull(r.incomePerHour),
+    totalProfit: dollarsOrNull(r.totalProfit),
     totalCustomers: r.totalCustomers,
     satisfaction: r.satisfaction >= 0 ? r.satisfaction : null,
     reliability: r.reliability,
@@ -602,28 +614,199 @@ function rideDetail(r: Ride) {
   };
 }
 
-// --- shops & facilities ----------------------------------------------------
+// --- flat track pieces (stalls, facilities and flat rides) -----------------
 
 /**
- * Every stall and facility -- burger bar, drink stall, souvenir shop, toilets,
- * first aid, cash machine, information kiosk -- is the same single 1x1 flat
- * track piece, so building one is always ridecreate + one trackplace.
- *
- * TrackElemType::FlatTrack1x1A is 262 in current OpenRCT2; 118 is the SV6/TD6
- * alias older builds use for the same piece. Ask the running game which
- * numbering it speaks rather than assuming.
+ * Every stall, facility and flat ride -- burger bar, toilets, merry-go-round,
+ * ferris wheel -- is a single flat track piece, so building one is always
+ * ridecreate plus one trackplace. Which of the ten pieces a ride type uses
+ * decides two things we cannot ask the game for: the footprint it covers, and
+ * which sides of that footprint will hold a ride entrance.
  */
-const SHOP_TRACK_TYPE_MODERN = 262;
-const SHOP_TRACK_TYPE_LEGACY = 118;
-let shopTrackTypeCache: number | null = null;
-function shopTrackType(): number {
-  if (shopTrackTypeCache === null) {
-    shopTrackTypeCache = context.getTrackSegment(SHOP_TRACK_TYPE_MODERN) !== null
-      ? SHOP_TRACK_TYPE_MODERN
-      : SHOP_TRACK_TYPE_LEGACY;
-  }
-  return shopTrackTypeCache;
+interface FlatPiece {
+  /** Track element type in current OpenRCT2 numbering. */
+  modern: number;
+  /** The SV6/TD6 alias older builds use for the same piece. */
+  legacy: number;
+  /**
+   * Per track sequence, a bitmask of the sides that accept a ride entrance or
+   * exit, in the piece's own unrotated frame (bit d = direction d). The game
+   * does not check this when the entrance is placed -- it deletes an entrance
+   * on any other side the next time it validates the ride's stations, which
+   * looks like the entrance simply vanishing. Honouring it up front is what
+   * makes an auto-placed entrance stay put.
+   */
+  entranceSides: number[];
 }
+
+/**
+ * Sequence order and entrance sides mirror OpenRCT2's own track element
+ * descriptors (src/openrct2/ride/ted/TED.FlatRide.h); the sequence at index i
+ * is the tile at getTrackSegment(...).elements[i].
+ */
+const FLAT_PIECES: Record<string, FlatPiece> = {
+  "1x1A": { modern: 262, legacy: 118, entranceSides: [0b0001] },
+  "1x1B": { modern: 264, legacy: 121, entranceSides: [0b1111] },
+  "1x4A": { modern: 257, legacy: 95, entranceSides: [0b1010, 0, 0b1010, 0] },
+  "1x4B": { modern: 263, legacy: 119, entranceSides: [0b0010, 0, 0b0010, 0] },
+  "1x4C": { modern: 265, legacy: 122, entranceSides: [0b1010, 0b1011, 0b1010, 0b1110] },
+  "1x5": { modern: 261, legacy: 116, entranceSides: [0b1010, 0, 0b1010, 0b1010, 0] },
+  "2x2": { modern: 258, legacy: 110, entranceSides: [0b1001, 0b0011, 0b1100, 0b0110] },
+  "2x4": {
+    modern: 260, legacy: 115,
+    entranceSides: [0b1001, 0b0001, 0b0001, 0b0011, 0b1100, 0b0100, 0b0100, 0b0110],
+  },
+  "3x3": {
+    modern: 266, legacy: 123,
+    entranceSides: [0, 0b1001, 0b0001, 0b0011, 0b1000, 0b0010, 0b1100, 0b0110, 0b0100],
+  },
+  "4x4": {
+    modern: 259, legacy: 111,
+    entranceSides: [
+      0b1001, 0b0001, 0b0001, 0b0011,
+      0b1000, 0, 0, 0b0010,
+      0b1000, 0, 0, 0b0010,
+      0b1100, 0b0100, 0b0100, 0b0110,
+    ],
+  },
+};
+
+/**
+ * Which piece each ride type builds with. Shops and facilities are in here
+ * alongside the flat rides because they are the same kind of placement -- note
+ * the information kiosk is the odd one out on 1x1B, the piece guests may use
+ * from all four sides.
+ */
+const FLAT_RIDE_PIECE: Record<number, string> = {
+  21: "2x2",  // spiral slide
+  25: "4x4",  // dodgems
+  26: "1x5",  // swinging ship
+  27: "1x4B", // swinging inverter ship
+  28: "1x1A", // food stall
+  30: "1x1A", // drink stall
+  32: "1x1A", // souvenir shop
+  33: "3x3",  // merry-go-round
+  35: "1x1B", // information kiosk
+  36: "1x1A", // toilets
+  37: "1x4C", // ferris wheel
+  38: "2x2",  // motion simulator
+  39: "3x3",  // 3D cinema
+  40: "3x3",  // top spin
+  41: "3x3",  // space rings
+  45: "1x1A", // cash machine
+  46: "3x3",  // twist
+  47: "3x3",  // haunted house
+  48: "1x1A", // first aid
+  49: "3x3",  // circus
+  70: "4x4",  // flying saucers
+  71: "3x3",  // crooked house
+  77: "1x4A", // magic carpet
+  81: "4x4",  // enterprise
+};
+
+/**
+ * The flat rides, as distinct from the stalls and facilities that build the
+ * same way. These are real rides: they have a station, an entrance and an exit,
+ * and guests queue for them.
+ */
+const FLAT_RIDE_LABEL: Record<number, string> = {
+  21: "spiral slide",
+  25: "dodgems",
+  26: "swinging ship",
+  27: "swinging inverter ship",
+  33: "merry-go-round",
+  37: "ferris wheel",
+  38: "motion simulator",
+  39: "3D cinema",
+  40: "top spin",
+  41: "space rings",
+  46: "twist",
+  47: "haunted house",
+  49: "circus",
+  70: "flying saucers",
+  71: "crooked house",
+  77: "magic carpet",
+  81: "enterprise",
+};
+
+/**
+ * Track element numbering moved when OpenRCT2 stopped reusing the RCT2 ids, so
+ * ask the running game which set it speaks instead of assuming.
+ */
+let flatPieceNumberingIsModern: boolean | null = null;
+function flatPieceType(pieceKey: string): number {
+  const piece = FLAT_PIECES[pieceKey];
+  if (!piece) throw new Error(`unknown flat track piece "${pieceKey}"`);
+  if (flatPieceNumberingIsModern === null) {
+    flatPieceNumberingIsModern = context.getTrackSegment(FLAT_PIECES["1x1A"].modern) !== null;
+  }
+  return flatPieceNumberingIsModern ? piece.modern : piece.legacy;
+}
+
+/** The piece a ride type builds with; "1x1A" for an unknown shop-like type. */
+function pieceKeyForRideType(rideType: number): string | undefined {
+  return FLAT_RIDE_PIECE[rideType];
+}
+
+/** Rotate a tile offset the way OpenRCT2 rotates a track block: CoordsXY::Rotate. */
+function rotateTileOffset(x: number, y: number, direction: number): { x: number; y: number } {
+  switch (direction & 3) {
+    case 1: return { x: y, y: -x };
+    case 2: return { x: -x, y: -y };
+    case 3: return { x: -y, y: x };
+    default: return { x, y };
+  }
+}
+
+interface Footprint {
+  pieceKey: string;
+  trackType: number;
+  /** Every tile the piece covers, tagged with the track sequence that lands there. */
+  tiles: Array<{ x: number; y: number; sequence: number }>;
+  width: number;
+  height: number;
+  /** "3x3" etc, in tiles -- the size the caller has to keep clear. */
+  size: string;
+  /** Offset of the block's low corner from the origin tile; (0,0) if the origin is a corner. */
+  originOffset: { x: number; y: number };
+}
+
+/**
+ * The tiles a piece covers when its origin is placed at (x,y) facing
+ * `direction`. The origin is not always a corner: a 3x3 flat ride is placed by
+ * its CENTRE tile, so a merry-go-round at (50,50) covers (49,49)-(51,51).
+ */
+function footprintOf(pieceKey: string, x: number, y: number, direction: number): Footprint {
+  const trackType = flatPieceType(pieceKey);
+  const seg = context.getTrackSegment(trackType);
+  const els = seg ? seg.elements : [];
+  const tiles: Array<{ x: number; y: number; sequence: number }> = [];
+  if (els.length === 0) {
+    // No descriptor for this piece in this build; a single tile is the only
+    // safe assumption, and trackplace will reject anything worse.
+    tiles.push({ x, y, sequence: 0 });
+  }
+  for (let i = 0; i < els.length; i++) {
+    const o = rotateTileOffset(Math.round(els[i].x / TILE), Math.round(els[i].y / TILE), direction);
+    tiles.push({ x: x + o.x, y: y + o.y, sequence: i });
+  }
+  let minX = tiles[0].x, maxX = tiles[0].x, minY = tiles[0].y, maxY = tiles[0].y;
+  for (const t of tiles) {
+    if (t.x < minX) minX = t.x;
+    if (t.x > maxX) maxX = t.x;
+    if (t.y < minY) minY = t.y;
+    if (t.y > maxY) maxY = t.y;
+  }
+  const width = maxX - minX + 1;
+  const height = maxY - minY + 1;
+  return {
+    pieceKey, trackType, tiles, width, height,
+    size: `${width}x${height}`,
+    originOffset: { x: minX - x, y: minY - y },
+  };
+}
+
+// --- shops & facilities ----------------------------------------------------
 
 /**
  * RCT2 ride type ids for stalls and facilities, fixed by the original game.
@@ -734,15 +917,23 @@ function shopAccess(r: Ride) {
   const entrance = entranceTile ? apronStatus(entranceTile) : null;
   const otherSideHasPath = adjacent.some((a) => !a.isEntranceSide && a.connected);
 
+  // The information kiosk is built on the 1x1 piece that opens on all four
+  // sides, so it is not fussy about which way it faces the way a stall is.
+  const pieceKey = pieceKeyForRideType(r.type);
+  const anySide = pieceKey !== undefined && FLAT_PIECES[pieceKey].entranceSides[0] === 0b1111;
+
   return {
     tile: { x: here.x, y: here.y, z },
     faces: facing,
     facesSide: facing === null ? null : DIRECTION_LABEL[facing],
+    anySide,
     entranceTile,
     entranceFrom,
     entrance,
     adjacent,
-    connected: entrance ? entrance.connected : adjacent.some((a) => a.connected),
+    connected: anySide
+      ? adjacent.some((a) => a.connected)
+      : entrance ? entrance.connected : adjacent.some((a) => a.connected),
     otherSideHasPath,
   };
 }
@@ -753,7 +944,218 @@ const SHOP_ACCESS_NOTE =
   + "neighbouring tile it faces, at the stall's own z. entranceTile is that tile "
   + "-- put a footpath there. If the wrong side is facing the path, remove_shop "
   + "and build_shop again with the right direction; there is no rotate action. "
-  + "adjacent lists all four sides so you can see which one the path is actually on.";
+  + "adjacent lists all four sides so you can see which one the path is actually on. "
+  + "The exception is the information kiosk (usableFromAnySide), which guests enter "
+  + "from whichever of its four sides they arrive on, so its facing does not matter.";
+
+// --- flat rides ------------------------------------------------------------
+
+/**
+ * The flat ride type an object provides, or undefined if it is a stall or a
+ * tracked ride. An object advertises up to three ride types with unused slots
+ * left at 255, same as the shop objects.
+ */
+function flatRideTypeOf(o: RideObject): number | undefined {
+  for (const t of o.rideType || []) {
+    if (FLAT_RIDE_LABEL[t] !== undefined) return t;
+  }
+  return undefined;
+}
+
+/** Reverse of flatPieceType, for reading a piece back off a placed track element. */
+function pieceKeyForTrackType(trackType: number): string | undefined {
+  for (const key in FLAT_PIECES) {
+    const p = FLAT_PIECES[key];
+    if (p.modern === trackType || p.legacy === trackType) return key;
+  }
+  return undefined;
+}
+
+/**
+ * Whether a ride entrance or exit building can stand on a tile. The game's own
+ * query is the authority; this is what lets us pick a sensible tile before
+ * asking, and explain the ones we passed over.
+ */
+function entranceSiteStatus(x: number, y: number, z: number) {
+  if (x < 0 || y < 0 || x >= map.size.x || y >= map.size.y) {
+    return { buildable: false, status: "off_map", detail: `(${x},${y}) is off the map` };
+  }
+  const tile = map.getTile(x, y);
+  const surf = surfaceOf(tile);
+  if (!surf) return { buildable: false, status: "off_map", detail: `no ground at (${x},${y})` };
+  if (!surf.hasOwnership && !surf.hasConstructionRights) {
+    return { buildable: false, status: "unowned", detail: `land at (${x},${y}) is not owned` };
+  }
+  if (isSubmerged(surf)) {
+    return { buildable: false, status: "under_water", detail: `(${x},${y}) is under water` };
+  }
+  const top = surfaceTopZ(surf);
+  if (top > z) {
+    return {
+      buildable: false, status: "ground_too_high",
+      detail: `ground at (${x},${y}) reaches z=${top}, ${levelsApart(top - z)} above the station's z=${z}`,
+    };
+  }
+  const blockers: string[] = [];
+  for (const el of tile.elements) {
+    const t = el.type;
+    if (t === "footpath" || t === "track" || t === "entrance" || t === "wall"
+      || t === "small_scenery" || t === "large_scenery") {
+      if (blockers.indexOf(t) < 0) blockers.push(t);
+    }
+  }
+  if (blockers.length > 0) {
+    return {
+      buildable: false, status: "blocked",
+      detail: `(${x},${y}) is occupied by ${blockers.join(", ")}`,
+    };
+  }
+  return {
+    buildable: true,
+    status: "clear",
+    detail: top === z ? `(${x},${y}) is clear and level with the station` : `(${x},${y}) is clear; the building will stand ${levelsApart(z - top)} above the ground`,
+  };
+}
+
+interface TrackTile {
+  x: number;
+  y: number;
+  z: number;
+  trackType: number;
+  sequence: number;
+  direction: number;
+}
+
+/**
+ * The track tiles a ride actually occupies, found by sweeping around its
+ * station. A flat ride is at most 4x4 and may be placed by its centre tile, so
+ * a radius of 4 covers every piece we can build.
+ */
+function rideTrackTiles(r: Ride): TrackTile[] {
+  const st = primaryStation(r);
+  const here = st ? tileCoords(st.start) : null;
+  if (!here) return [];
+  const out: TrackTile[] = [];
+  for (let dx = -4; dx <= 4; dx++) {
+    for (let dy = -4; dy <= 4; dy++) {
+      const x = here.x + dx;
+      const y = here.y + dy;
+      if (x < 0 || y < 0 || x >= map.size.x || y >= map.size.y) continue;
+      for (const el of map.getTile(x, y).elements) {
+        if (el.type !== "track") continue;
+        const t = el as TrackElement;
+        if (t.ride !== r.id) continue;
+        out.push({
+          x, y, z: t.baseZ, trackType: t.trackType,
+          sequence: t.sequence === null || t.sequence === undefined ? 0 : t.sequence,
+          direction: t.direction & 3,
+        });
+      }
+    }
+  }
+  return out;
+}
+
+interface EntranceSite {
+  /** Tile the entrance or exit building stands on. */
+  x: number;
+  y: number;
+  z: number;
+  /** Direction the building faces -- INTO the ride, matching the tile element. */
+  direction: number;
+  side: string;
+  /** The ride tile it attaches to. */
+  trackTile: { x: number; y: number };
+  /** Tile a footpath (or queue) must occupy to reach it. */
+  connectAt: { x: number; y: number; z: number };
+}
+
+/**
+ * Every tile that will hold this ride's entrance or exit.
+ *
+ * Only some sides of a flat ride's footprint take one: the game accepts the
+ * placement anywhere but then quietly deletes an entrance on a side the track
+ * piece does not list, so a ride built that way loses its entrance without ever
+ * reporting an error. These are the sides that survive.
+ */
+function rideEntranceSites(r: Ride, stationZ: number): EntranceSite[] {
+  const out: EntranceSite[] = [];
+  const seen: Record<string, boolean> = {};
+  for (const t of rideTrackTiles(r)) {
+    if (t.z !== stationZ) continue;
+    const key = pieceKeyForTrackType(t.trackType);
+    if (key === undefined) continue;
+    const sides = FLAT_PIECES[key].entranceSides;
+    const mask = t.sequence < sides.length ? sides[t.sequence] : 0;
+    for (let local = 0; local < 4; local++) {
+      if ((mask & (1 << local)) === 0) continue;
+      const outward = (local + t.direction) & 3;
+      const d = DIRECTION_DELTA[outward];
+      const x = t.x + d.dx;
+      const y = t.y + d.dy;
+      const tag = `${x},${y},${outward}`;
+      if (seen[tag]) continue;
+      seen[tag] = true;
+      out.push({
+        x, y, z: stationZ,
+        direction: (outward + 2) & 3,
+        side: DIRECTION_LABEL[outward],
+        trackTile: { x: t.x, y: t.y },
+        connectAt: { x: x + d.dx, y: y + d.dy, z: stationZ },
+      });
+    }
+  }
+  return out;
+}
+
+/** An entrance site with everything the caller needs to judge it. */
+function describeEntranceSite(s: EntranceSite) {
+  const site = entranceSiteStatus(s.x, s.y, s.z);
+  const path = apronStatus(s.connectAt);
+  return {
+    x: s.x, y: s.y, z: s.z,
+    direction: s.direction,
+    facesSide: s.side,
+    trackTile: s.trackTile,
+    connectAt: s.connectAt,
+    site,
+    path,
+    /** Free tile that a path already reaches is the best kind of site. */
+    score: (site.buildable ? 1 : 0) + (path.connected ? 2 : 0),
+  };
+}
+
+/** The station z a ride's entrance and exit sit at. */
+function stationBaseZ(r: Ride, index: number): number | null {
+  const stations = r.stations || [];
+  const st = stations[index];
+  const c = st ? tileCoords(st.start) : null;
+  return c && c.z !== undefined ? c.z : null;
+}
+
+function placeEntranceExit(
+  rideId: number,
+  station: number,
+  s: { x: number; y: number; direction: number },
+  isExit: boolean,
+) {
+  const args = {
+    x: s.x * TILE, y: s.y * TILE,
+    direction: s.direction as Direction,
+    ride: rideId, station, isExit,
+  };
+  return queryAction("rideentranceexitplace", args)
+    .then(() => execAction("rideentranceexitplace", args));
+}
+
+/** The one-line explanation of ride access, kept identical everywhere it is said. */
+const RIDE_ACCESS_NOTE =
+  "A ride needs BOTH an entrance and an exit, each on its own tile beside the "
+  + "ride, and guests reach them over the tile one further out -- that is what "
+  + "connectAt gives you. Queue guests up to the entrance with place_path "
+  + "queue:true; a plain footpath is enough at the exit. Only the sides the "
+  + "track piece lists will hold an entrance, so build on one of the sites "
+  + "reported here rather than any neighbouring tile.";
 
 // ---------------------------------------------------------------------------
 // handlers
@@ -834,8 +1236,8 @@ handlers[Methods.ListShops] = (_p, ok) => {
       classification: r.classification,
       status: r.status,
       prices: (r.price || []).map((x) => dollars(x)),
-      incomePerHour: dollars(r.incomePerHour),
-      totalProfit: dollars(r.totalProfit),
+      incomePerHour: dollarsOrNull(r.incomePerHour),
+      totalProfit: dollarsOrNull(r.totalProfit),
       totalCustomers: r.totalCustomers,
     })),
   });
@@ -1453,7 +1855,14 @@ handlers[Methods.CheckRideAccess] = (p, ok, fail) => {
     const access = shopAccess(r);
     if (!access) return fail(`shop ${id} has no placed tile to check`);
 
-    if (!access.entranceTile) {
+    if (access.anySide) {
+      if (!access.connected) {
+        problems.push(
+          `${r.name} can be used from any of its four sides, and no footpath reaches any of them; `
+          + "path one of the tiles in `adjacent` at the z given",
+        );
+      }
+    } else if (!access.entranceTile) {
       problems.push(`${r.name} is placed but its facing could not be read; check it in-game`);
     } else if (access.entrance && !access.entrance.connected) {
       problems.push(
@@ -1474,6 +1883,7 @@ handlers[Methods.CheckRideAccess] = (p, ok, fail) => {
       tile: access.tile,
       faces: access.faces,
       facesSide: access.facesSide,
+      usableFromAnySide: access.anySide,
       facingReadFrom: access.entranceFrom,
       entranceTile: access.entranceTile,
       entrance: access.entrance,
@@ -1513,14 +1923,30 @@ handlers[Methods.CheckRideAccess] = (p, ok, fail) => {
     (s) => s.entrance.built && s.entrance.access.connected && s.exit.built && s.exit.access.connected,
   );
 
+  // When a piece is missing, the useful answer is where it is allowed to go --
+  // most tiles beside a ride will not hold an entrance at all.
+  const missing = stations.length > 0 && stations.some((s) => !s.entrance.built || !s.exit.built);
+  const sz = stationBaseZ(r, 0);
+  const sites = missing && sz !== null ? rideEntranceSites(r, sz).map(describeEntranceSite) : [];
+
   ok({
     rideId: r.id, name: r.name, classification: r.classification, status: r.status,
     connected,
     stations,
+    ...(sites.length > 0
+      ? {
+        entranceSites: sites.map((s) => ({
+          x: s.x, y: s.y, z: s.z, facesSide: s.facesSide,
+          connectAt: s.connectAt, buildable: s.site.buildable,
+          detail: s.site.detail, pathConnected: s.path.connected,
+        })),
+      }
+      : {}),
     problems,
     note: "connectAt is the tile a footpath must occupy to reach that entrance or exit "
       + "-- build there, at the z given. Guests need BOTH the entrance and the exit "
-      + "connected before a ride works.",
+      + "connected before a ride works."
+      + (sites.length > 0 ? " entranceSites lists every tile that will hold the missing piece; pass one to build_ride_entrance." : ""),
   });
 };
 
@@ -1624,7 +2050,9 @@ handlers[Methods.BuildShop] = (p, ok, fail) => {
     z,
     direction: direction as Direction,
     ride: 0, // filled in once the ride exists
-    trackType: shopTrackType(),
+    // A shop's piece is almost always the plain 1x1; the information kiosk is
+    // the exception, on the variant guests may use from all four sides.
+    trackType: flatPieceType(pieceKeyForRideType(rideType) || "1x1A"),
     rideType,
     brakeSpeed: 0,
     colour: 0,
@@ -1746,6 +2174,416 @@ handlers[Methods.RemoveShop] = (p, ok, fail) => {
     .catch((e) => {
       restore();
       fail(`remove_shop ${id} ("${name}"): ${String(e.message || e)}`);
+    });
+};
+
+// --- build: flat rides -----------------------------------------------------
+
+handlers[Methods.ListRideTypes] = (p, ok) => {
+  const includeUnresearched = bool(p, "include_unresearched", false);
+  const all = objectManager.getAllObjects("ride") || [];
+
+  const available: Array<Record<string, unknown>> = [];
+  const locked: Array<Record<string, unknown>> = [];
+  for (const o of all) {
+    const rideType = flatRideTypeOf(o);
+    if (rideType === undefined) continue;
+    const pieceKey = pieceKeyForRideType(rideType);
+    if (pieceKey === undefined) continue;
+    const fp = footprintOf(pieceKey, 0, 0, 0);
+    const entry = {
+      object: o.index,
+      name: o.name,
+      identifier: o.identifier,
+      rideType,
+      kind: FLAT_RIDE_LABEL[rideType],
+      footprint: fp.size,
+      tiles: fp.tiles.length,
+      // The origin tile build_ride takes is not always a corner of the
+      // footprint; say where it sits so the caller can aim.
+      originOffset: fp.originOffset,
+      excitement: o.excitementMultiplier,
+      intensity: o.intensityMultiplier,
+      nausea: o.nauseaMultiplier,
+    };
+    if (isResearched(o.index)) available.push(entry);
+    else locked.push(entry);
+  }
+
+  ok({
+    count: available.length,
+    rideTypes: available,
+    ...(includeUnresearched
+      ? { lockedCount: locked.length, locked }
+      : locked.length > 0
+        ? { lockedCount: locked.length, note2: `${locked.length} more are loaded but not yet researched; pass include_unresearched to see them` }
+        : {}),
+    note: "These are the FLAT rides -- one track piece each, so build_ride can place them "
+      + "whole. Tracked rides (roller coasters, transport rides) are not in this list and "
+      + "cannot be built: they need track laid piece by piece. `footprint` is the block of "
+      + "tiles the ride covers, and `originOffset` is where the x,y you pass to build_ride "
+      + "sits inside it -- (0,0) means a corner, (-1,-1) means the origin is one in from "
+      + "the corner, as it is for every 3x3 ride.",
+  });
+};
+
+handlers[Methods.BuildRide] = (p, ok, fail) => {
+  const x = Math.floor(num(p, "x"));
+  const y = Math.floor(num(p, "y"));
+  const objectIndex = Math.floor(num(p, "object"));
+  const direction = Math.floor(num(p, "direction", 0)) & 3;
+  const name = p.name === undefined || p.name === null ? null : str(p, "name");
+  const wantAccess = bool(p, "place_entrance_exit", true);
+  const askedEntrance = p.entrance_x !== undefined && p.entrance_y !== undefined;
+  const askedExit = p.exit_x !== undefined && p.exit_y !== undefined;
+
+  let obj: RideObject | null = null;
+  try {
+    obj = objectManager.getObject("ride", objectIndex);
+  } catch (_e) {
+    obj = null;
+  }
+  if (!obj) return fail(`no ride object with index ${objectIndex}; call list_ride_types for the indices this park has`);
+
+  const rideType = flatRideTypeOf(obj);
+  if (rideType === undefined) {
+    if (shopRideTypeOf(obj, shopRideTypes()) !== undefined) {
+      return fail(`"${obj.name}" (object ${objectIndex}) is a stall or facility; build it with build_shop`);
+    }
+    return fail(
+      `"${obj.name}" (object ${objectIndex}) is a tracked ride -- it is built by laying track piece by piece, `
+      + "which this agent cannot do. build_ride builds flat rides only; call list_ride_types for the ones it can build.",
+    );
+  }
+  if (!isResearched(objectIndex)) {
+    return fail(`"${obj.name}" has not been researched yet and cannot be built`);
+  }
+
+  const pieceKey = pieceKeyForRideType(rideType) || "1x1A";
+  const fp = footprintOf(pieceKey, x, y, direction);
+  const covers = fp.tiles.map((t) => `(${t.x},${t.y})`).join(" ");
+
+  // Pre-flight every tile the piece covers before creating anything: ridecreate
+  // allocates a ride slot the moment it succeeds, and a ride this size fails
+  // over a tile the caller never thought about.
+  let topZ = -1;
+  for (const t of fp.tiles) {
+    if (t.x < 0 || t.y < 0 || t.x >= map.size.x || t.y >= map.size.y) {
+      return fail(`(${t.x},${t.y}) is off the map; a ${fp.size} ride placed at (${x},${y}) facing ${DIRECTION_LABEL[direction]} covers ${covers}`);
+    }
+    const surf = surfaceOf(map.getTile(t.x, t.y));
+    if (!surf) {
+      return fail(`no ground at (${t.x},${t.y}); a ${fp.size} ride placed at (${x},${y}) covers ${covers}`);
+    }
+    if (!surf.hasOwnership && !surf.hasConstructionRights) {
+      return fail(`land at (${t.x},${t.y}) is not owned; a ${fp.size} ride placed at (${x},${y}) covers ${covers}`);
+    }
+    const tz = surfaceTopZ(surf);
+    if (tz > topZ) topZ = tz;
+  }
+
+  const baseZ = p.z !== undefined ? num(p, "z") : topZ;
+  const z = baseZ + Math.floor(num(p, "height_offset", 0)) * LAND_STEP_Z;
+  if (z < LAND_STEP_Z) return fail(`resolved z ${z} is below the lowest buildable level (${LAND_STEP_Z})`);
+
+  const trackArgs = {
+    x: x * TILE,
+    y: y * TILE,
+    z,
+    direction: direction as Direction,
+    ride: 0, // filled in once the ride exists
+    trackType: fp.trackType,
+    rideType,
+    brakeSpeed: 0,
+    colour: 0,
+    seatRotation: 4,
+    trackPlaceFlags: 0,
+    isFromTrackDesign: false,
+  };
+
+  const restore = unpauseFor();
+  let rideId = -1;
+  let cost = 0;
+  let nameError: string | null = null;
+  let entranceOut: Record<string, unknown> | null = null;
+  let exitOut: Record<string, unknown> | null = null;
+  let sites: Array<ReturnType<typeof describeEntranceSite>> = [];
+  let noStation = false;
+  const used: Array<{ x: number; y: number }> = [];
+
+  // Pick the site the caller named, or the best one going: a clear tile that a
+  // path already reaches beats a clear tile that nothing reaches.
+  const choose = (wantX: number | undefined, wantY: number | undefined, what: string) => {
+    if (wantX !== undefined && wantY !== undefined) {
+      for (const s of sites) {
+        if (s.x === wantX && s.y === wantY) return s;
+      }
+      throw new Error(
+        `(${wantX},${wantY}) is not a tile this ride's ${what} can attach to; `
+        + `the track piece takes one only at ${sites.map((s) => `(${s.x},${s.y})`).join(" ") || "no tile at all"}`,
+      );
+    }
+    let best: ReturnType<typeof describeEntranceSite> | null = null;
+    for (const s of sites) {
+      if (used.some((u) => u.x === s.x && u.y === s.y)) continue;
+      if (!s.site.buildable) continue;
+      if (best === null || s.score > best.score) best = s;
+    }
+    if (best === null) throw new Error(`no free tile beside the ride will take its ${what}`);
+    return best;
+  };
+
+  const place = (what: string, wantX: number | undefined, wantY: number | undefined, isExit: boolean) => {
+    let site: ReturnType<typeof describeEntranceSite>;
+    try {
+      site = choose(wantX, wantY, what);
+    } catch (e: any) {
+      return Promise.resolve({ placed: false, error: String(e.message || e) } as Record<string, unknown>);
+    }
+    used.push({ x: site.x, y: site.y });
+    return placeEntranceExit(rideId, 0, site, isExit)
+      .then((res: GameActionResult) => {
+        cost += dollars(res.cost || 0);
+        return {
+          placed: true,
+          x: site.x, y: site.y, z: site.z,
+          direction: site.direction,
+          facesSide: site.facesSide,
+          connectAt: site.connectAt,
+          path: apronStatus(site.connectAt),
+        } as Record<string, unknown>;
+      })
+      .catch((e: any) => ({
+        placed: false,
+        x: site.x, y: site.y,
+        error: String(e.message || e),
+      } as Record<string, unknown>));
+  };
+
+  execAction("ridecreate", {
+    rideType,
+    rideObject: objectIndex,
+    entranceObject: 0,
+    colour1: 0,
+    colour2: 0,
+    inspectionInterval: 0,
+  })
+    .then((created: GameActionResult) => {
+      const id = (created as RideCreateActionResult).ride;
+      if (id === undefined || id === null) throw new Error("the game created the ride but reported no id");
+      rideId = id;
+      trackArgs.ride = id;
+      // Query first so a refusal reports the game's own reason, then place.
+      return queryAction("trackplace", trackArgs)
+        .then(() => execAction("trackplace", trackArgs))
+        .catch((e) =>
+          // The ride slot is already allocated. A ride that never got its track
+          // would sit in the ride list forever and count against the ride
+          // limit, so hand it back before reporting the failure.
+          execAction("ridedemolish", { ride: id, modifyType: 0 })
+            .catch(() => undefined)
+            .then(() => { throw e; }),
+        );
+    })
+    .then((placed: GameActionResult) => {
+      cost += dollars(placed.cost || 0);
+      if (name === null) return undefined;
+      // A rejected rename is not worth throwing away a built ride over; say so
+      // and let the caller retry it.
+      return execAction("ridesetname", { ride: rideId, name })
+        .then(() => undefined)
+        .catch((e) => { nameError = String(e.message || e); return undefined; });
+    })
+    .then(() => {
+      if (!wantAccess) return undefined;
+      let r: Ride | null = null;
+      try {
+        r = map.getRide(rideId);
+      } catch (_e) {
+        r = null;
+      }
+      const sz = r ? stationBaseZ(r, 0) : null;
+      if (!r || sz === null) { noStation = true; return undefined; }
+      sites = rideEntranceSites(r, sz).map(describeEntranceSite);
+      return place("entrance", askedEntrance ? Math.floor(num(p, "entrance_x")) : undefined,
+        askedEntrance ? Math.floor(num(p, "entrance_y")) : undefined, false)
+        .then((res) => {
+          entranceOut = res;
+          return place("exit", askedExit ? Math.floor(num(p, "exit_x")) : undefined,
+            askedExit ? Math.floor(num(p, "exit_y")) : undefined, true);
+        })
+        .then((res) => { exitOut = res; return undefined; });
+    })
+    .then(() => {
+      restore();
+      let r: Ride | null = null;
+      try {
+        r = map.getRide(rideId);
+      } catch (_e) {
+        r = null;
+      }
+      const warnings: string[] = [];
+      const check = (what: string, out: Record<string, unknown> | null) => {
+        if (out === null) return;
+        if (!out.placed) {
+          warnings.push(`the ${what} was not built: ${out.error}. Build it with build_ride_entrance once the tile is clear.`);
+          return;
+        }
+        const path = out.path as { connected: boolean; detail: string } | undefined;
+        if (path && !path.connected) {
+          const at = out.connectAt as { x: number; y: number; z: number };
+          warnings.push(
+            `nothing reaches the ${what} yet: ${path.detail}. Guests need a path on (${at.x},${at.y}) at z=${at.z}`
+            + `${what === "entrance" ? " -- a queue line (place_path queue:true) is what belongs there" : ""}.`,
+          );
+        }
+      };
+      check("entrance", entranceOut);
+      check("exit", exitOut);
+      if (noStation) {
+        warnings.push(
+          "the track went down but the game reports no station for it, so the entrance and exit were "
+          + "not placed. Check the ride in-game; check_ride_access will show what it sees.",
+        );
+      }
+
+      const spare = sites.filter((s) => !used.some((u) => u.x === s.x && u.y === s.y) && s.site.buildable);
+
+      ok({
+        built: true,
+        rideId,
+        name: r ? r.name : name,
+        object: objectIndex,
+        objectName: obj ? obj.name : null,
+        rideType,
+        kind: FLAT_RIDE_LABEL[rideType],
+        classification: r ? r.classification : null,
+        x, y, z,
+        groundTopZ: topZ,
+        direction,
+        facesSide: DIRECTION_LABEL[direction],
+        footprint: { size: fp.size, tiles: fp.tiles.map((t) => ({ x: t.x, y: t.y })) },
+        cost,
+        status: r ? r.status : null,
+        entrance: entranceOut,
+        exit: exitOut,
+        ...(spare.length > 0
+          ? { otherEntranceSites: spare.map((s) => ({ x: s.x, y: s.y, facesSide: s.facesSide, connectAt: s.connectAt, pathConnected: s.path.connected })) }
+          : {}),
+        ...(warnings.length > 0 ? { warnings } : {}),
+        ...(nameError ? { nameError: `the ride was built but renaming failed: ${nameError}` } : {}),
+        note: "A new ride is CLOSED and priced at 0. Call set_ride_price then open_ride -- open_ride "
+          + "will refuse until the entrance and exit are both built and reachable. " + RIDE_ACCESS_NOTE,
+      });
+    })
+    .catch((e) => {
+      restore();
+      fail(`build_ride "${obj ? obj.name : objectIndex}" at (${x},${y}) z=${z}: ${String(e.message || e)}`);
+    });
+};
+
+handlers[Methods.BuildRideEntrance] = (p, ok, fail) => {
+  const id = num(p, "ride_id");
+  const x = Math.floor(num(p, "x"));
+  const y = Math.floor(num(p, "y"));
+  const station = Math.floor(num(p, "station", 0));
+  const isExit = bool(p, "is_exit", false);
+  const what = isExit ? "exit" : "entrance";
+
+  let r: Ride | null = null;
+  try {
+    r = map.getRide(id);
+  } catch (_e) {
+    r = null;
+  }
+  if (!r) return fail(`no ride with id ${id}`);
+  if (isShop(r)) {
+    return fail(`"${r.name}" is a ${r.classification}: stalls and facilities have no entrance element, guests use them from the side they face (see check_ride_access)`);
+  }
+  if (r.status !== "closed") {
+    return fail(`"${r.name}" is ${r.status}; the game will not move a ride's entrance or exit while it is open. Call close_ride ${id} first.`);
+  }
+
+  const sz = stationBaseZ(r, station);
+  if (sz === null) return fail(`station ${station} of "${r.name}" has no built track to attach ${isExit ? "an exit" : "an entrance"} to`);
+
+  const sites = rideEntranceSites(r, sz);
+  let chosen: EntranceSite | null = null;
+  for (const s of sites) {
+    if (s.x === x && s.y === y) { chosen = s; break; }
+  }
+  if (!chosen) {
+    return fail(
+      `(${x},${y}) is not a tile this ride's ${what} can attach to. The game would accept the build and then `
+      + `silently delete it, because the track piece only takes an entrance on certain sides. Valid tiles: `
+      + (sites.length > 0
+        ? sites.map((s) => `(${s.x},${s.y}) reached from (${s.connectAt.x},${s.connectAt.y})`).join(", ")
+        : "none found -- check the ride actually has track at this station"),
+    );
+  }
+
+  const site = chosen;
+  const status = entranceSiteStatus(site.x, site.y, site.z);
+  if (!status.buildable) return fail(`cannot build the ${what} at (${x},${y}): ${status.detail}`);
+
+  const restore = unpauseFor();
+  placeEntranceExit(id, station, site, isExit)
+    .then((res: GameActionResult) => {
+      restore();
+      const path = apronStatus(site.connectAt);
+      ok({
+        built: true,
+        rideId: id,
+        name: r ? r.name : null,
+        kind: what,
+        station,
+        x: site.x, y: site.y, z: site.z,
+        direction: site.direction,
+        facesSide: site.side,
+        connectAt: site.connectAt,
+        path,
+        cost: dollars(res.cost || 0),
+        ...(path.connected
+          ? {}
+          : { warning: `nothing reaches it yet: ${path.detail}` }),
+        note: RIDE_ACCESS_NOTE,
+      });
+    })
+    .catch((e) => {
+      restore();
+      fail(`build_ride_entrance ${id} ${what} at (${x},${y}): ${String(e.message || e)}`);
+    });
+};
+
+handlers[Methods.RemoveRide] = (p, ok, fail) => {
+  const id = num(p, "ride_id");
+  let r: Ride | null = null;
+  try {
+    r = map.getRide(id);
+  } catch (_e) {
+    r = null;
+  }
+  if (!r) return fail(`no ride with id ${id}`);
+  if (isShop(r)) {
+    return fail(`ride ${id} ("${r.name}") is a ${r.classification}; remove it with remove_shop`);
+  }
+  // Read what we want to report before the ride stops existing.
+  const name = r.name;
+  const st = primaryStation(r);
+  const where = st ? tileCoords(st.start) : null;
+  const tiles = rideTrackTiles(r).map((t) => ({ x: t.x, y: t.y }));
+
+  const restore = unpauseFor();
+  // One action: demolishing the ride takes its track, entrance and exit with it.
+  execAction("ridedemolish", { ride: id, modifyType: 0 })
+    .then((res: GameActionResult) => {
+      restore();
+      // Negative cost is money coming back; report it as a positive refund.
+      ok({ removed: true, rideId: id, name, tile: where, tiles, refund: dollars(-(res.cost || 0)) });
+    })
+    .catch((e) => {
+      restore();
+      fail(`remove_ride ${id} ("${name}"): ${String(e.message || e)}`);
     });
 };
 

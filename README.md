@@ -2,12 +2,15 @@
 
 An MCP server + OpenRCT2 plugin that lets an agent **sidecar-manage** your park
 while you play: read the state, act on the business (prices, staff, marketing,
-loans), lay footpaths and put up shops, see the park (screenshots), and control
-time.
+loans), lay footpaths, put up shops and build rides, see the park (screenshots),
+and control time.
 
-Building is deliberately narrow. The agent can place **footpaths** and **stalls
-and facilities** — the things a park needs a lot of and that fit on one tile.
-Rides are still hands-off: it can recommend one, but not build it.
+Building stops short of track. The agent can place **footpaths**, **stalls and
+facilities**, and **flat rides** — merry-go-round, ferris wheel, dodgems,
+haunted house and the rest, each a single track piece it can drop whole, with
+its entrance and exit. Tracked rides (roller coasters, transport rides) are
+still hands-off: they are built segment by segment, and there is no tool for
+that.
 
 ## How it fits together
 
@@ -89,6 +92,9 @@ claude mcp add rct2-agent --scope project \
 
 **Build — shops & facilities:** `list_shop_types`, `build_shop`, `remove_shop`
 
+**Build — flat rides:** `list_ride_types`, `build_ride`, `build_ride_entrance`,
+`remove_ride`
+
 **See (vision):** `capture_view`, `capture_ride`, `find_location`,
 `find_park_entrance`
 
@@ -125,9 +131,31 @@ claude mcp add rct2-agent --scope project \
   for shops and all four neighbours, so a mistake is visible.
 - **Facilities are shops here.** Toilets, first aid, the cash machine and the
   information kiosk build exactly like a food stall and go through the same
-  `list_shop_types` / `build_shop` / `remove_shop` tools.
+  `list_shop_types` / `build_shop` / `remove_shop` tools. The information kiosk
+  is the one that sits on a different track piece and can be entered from all
+  four sides, so its facing does not matter (`usableFromAnySide` in
+  `check_ride_access`).
 - **A new shop opens closed and priced at 0** — `build_shop` says so in its
   result. Follow up with `set_shop_price` and `open_ride`.
+- **Flat rides cover a block, not a tile.** `list_ride_types` gives each type's
+  `footprint` and `originOffset`; the x,y passed to `build_ride` is the piece's
+  origin, which for every 3x3 ride is the **centre** tile, so a merry-go-round
+  at (50,50) covers (49,49)–(51,51). All of it must be owned, clear and level.
+- **Only some sides of a ride will hold an entrance.** Which ones is fixed by
+  the track piece. The game accepts a `rideentranceexitplace` on any tile and
+  then *silently deletes* an entrance on a disallowed side the next time it
+  validates the ride, so `build_ride` picks from the legal sides only —
+  preferring one a footpath already reaches — and `check_ride_access` reports
+  them as `entranceSites` when a piece is missing. The table of legal sides per
+  piece lives in `FLAT_PIECES` in the plugin, mirroring OpenRCT2's own
+  `TED.FlatRide.h`.
+- **A new ride opens closed and priced at 0**, same as a shop, and `open_ride`
+  refuses until the entrance and exit are both built and reachable. Guests reach
+  the entrance over its `connectAt` tile, and that wants a **queue line**
+  (`place_path` with `queue: true`); a plain path at the exit's `connectAt` is
+  enough.
+- **There is no rotate action** for rides either — `remove_ride` and build again
+  with a different `direction`.
 
 ## Dev
 

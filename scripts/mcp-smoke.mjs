@@ -5,7 +5,8 @@ import net from "node:net";
 import { spawn } from "node:child_process";
 import path from "node:path";
 
-const PLUGIN_PORT = 7860;
+// Not the default port: a real OpenRCT2 may already be sitting on that one.
+const PLUGIN_PORT = 7898;
 
 // --- fake plugin: echoes any method back as ok, with a couple of shaped replies
 const fake = net.createServer((sock) => {
@@ -85,7 +86,16 @@ async function run() {
   const expectFail = await send(5, "tools/call", { name: "get_ride", arguments: {} }); // missing required arg
   console.log("get_ride(no arg) isError:", expectFail.result?.isError === true || expectFail.error !== undefined);
 
-  const okCount = names.length >= 25 && init.result && ping.result?.content?.[0]?.text?.includes("Fake Park");
+  const built = await send(6, "tools/call", { name: "build_ride", arguments: { x: 50, y: 50, object: 3, direction: 1, name: "Carousel" } });
+  console.log("build_ride ->", built.result?.content?.[0]?.text?.replace(/\s+/g, " ").slice(0, 160));
+
+  const rideTools = ["list_ride_types", "build_ride", "build_ride_entrance", "remove_ride"];
+  const haveRideTools = rideTools.every((t) => names.includes(t));
+  console.log("ride tools registered:", haveRideTools);
+
+  const okCount = names.length >= 25 && haveRideTools && init.result
+    && ping.result?.content?.[0]?.text?.includes("Fake Park")
+    && built.result?.content?.[0]?.text?.includes("\"direction\": 1");
   console.log(okCount ? "\nMCP SMOKE: PASS" : "\nMCP SMOKE: FAIL");
   server.kill();
   fake.close();

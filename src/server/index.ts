@@ -231,7 +231,7 @@ passthrough("inspect_area",
   { map: (a) => ({ x: a.x, y: a.y, radius: a.radius ?? 6 }) });
 
 passthrough("get_tile_detail",
-  "Get exact per-tile detail for a small, explicit list of tiles: ground height (low corner `z` and high corner `topZ`), slope, water level, ownership, and full detail of every element placed there — footpaths (with `edgeZ`, the world z each of the tile's four sides presents; two neighbouring paths are walkable between ONLY if the edges they turn to each other are both non-null and exactly equal), ride entrances/exits (with `connectAt`, the tile a path has to sit on to reach them — `direction` points INTO the ride, not out toward guests), track, small/large scenery, walls, and banners, each with its object name. Call this on the handful of tiles you're actually about to act on (found via inspect_area, get_ride, or check_ride_access) rather than sweeping a whole area — cost scales with tiles requested, not map size.",
+  "Get exact per-tile detail for a small, explicit list of tiles: ground height (low corner `z` and high corner `topZ`), slope, water level, ownership, and full detail of every element placed there — footpaths (with `edgeZ`, the world z each of the tile's four sides presents; two neighbouring paths are walkable between ONLY if the edges they turn to each other are both non-null and exactly equal), ride entrances/exits (with `connectAt`, the tile a path has to sit on to reach them — `direction` points INTO the ride, not out toward guests), track, small/large scenery, walls, and banners, each with its object name. A footpath element also carries `isQueue` and `ride`: when `isQueue` is true and `ride` is set, that tile is a queue line bound to that one ride — only a guest already queueing for that specific ride will walk it, so it is not general through traffic for guests or staff heading anywhere else, even if the tile is otherwise identical to a normal path. Call this on the handful of tiles you're actually about to act on (found via inspect_area, get_ride, or check_ride_access) rather than sweeping a whole area — cost scales with tiles requested, not map size.",
   {
     tiles: z.array(z.object({ x: z.number().int(), y: z.number().int() })).min(1).max(40)
       .describe("Tiles to inspect, up to 40 per call."),
@@ -244,7 +244,7 @@ passthrough("list_path_styles",
   {}, Methods.ListPathStyles);
 
 passthrough("place_path",
-  "Place ONE footpath tile, following the terrain by default: z defaults to the tile's high corner for a flat path and its low corner for a sloped one, so on flat ground you need only x and y. Pass height_offset to raise it in whole land levels, or z for an exact world z. Omit slope_direction for a flat tile; set it (0-3) to slope the tile upward toward that direction, with z as the LOW end. On sloping ground a flat tile is often rejected with 'Raise or lower land first' — slope the tile to match the terrain instead, checking the tile's slope via get_tile_detail. Errors carry the game's own reason; read it and adjust. Works while the game is paused. Call repeatedly to build a route — and after each call READ THE CONNECTION REPORT before placing the next tile: `connectedTo` lists what this tile actually joined, `neighborsNotConnected` names every neighbouring path or entrance it missed and why, with `connectAtZ` giving the z that would have worked, and `edgeZ` gives the heights this tile now presents on its four sides for the next one to meet. A tile that comes back with an empty `connectedTo` and a `warning` has broken the route: fix it before continuing, because a path one land level off its neighbour looks like a finished route from above and is not walkable. To reach a ride entrance or exit, build on the connectAt tile that get_ride / check_ride_access report — do NOT derive it from the entrance's `direction`, which points into the ride, not out toward the guests.",
+  "Place ONE footpath tile, following the terrain by default: z defaults to the tile's high corner for a flat path and its low corner for a sloped one, so on flat ground you need only x and y. Pass height_offset to raise it in whole land levels, or z for an exact world z. Omit slope_direction for a flat tile; set it (0-3) to slope the tile upward toward that direction, with z as the LOW end. On sloping ground a flat tile is often rejected with 'Raise or lower land first' — slope the tile to match the terrain instead, checking the tile's slope via get_tile_detail. Errors carry the game's own reason; read it and adjust. Works while the game is paused. Call repeatedly to build a route — and after each call READ THE CONNECTION REPORT before placing the next tile: `connectedTo` lists what this tile actually joined, `neighborsNotConnected` names every neighbouring path or entrance it missed and why, with `connectAtZ` giving the z that would have worked, and `edgeZ` gives the heights this tile now presents on its four sides for the next one to meet. A tile that comes back with an empty `connectedTo` and a `warning` has broken the route: fix it before continuing, because a path one land level off its neighbour looks like a finished route from above and is not walkable. A tile placed with queue:true is bound to whichever ride's entrance it leads to and is walkable only by guests already queueing for that ride — do not route unrelated traffic through it to reach something further along. To reach a ride entrance or exit, build on the connectAt tile that get_ride / check_ride_access report — do NOT derive it from the entrance's `direction`, which points into the ride, not out toward the guests.",
   {
     x: z.number().int(),
     y: z.number().int(),
@@ -268,7 +268,7 @@ passthrough("place_path",
   } });
 
 passthrough("check_ride_access",
-  "Check whether guests can actually reach a ride: per station it reports the entrance and exit, the exact tile a footpath must occupy to connect to each (connectAt), and whether a path is there at the right height — plus a flat `problems` list naming what to fix. Use this instead of reading a footpath's `edges`, which only records path-to-path links and never shows a connection to a ride entrance. A ride needs BOTH entrance and exit connected. Stalls and facilities have no entrance element: they are checked against the one side the shop faces, reported as `entranceTile`, with every neighbouring side listed so a shop built facing the wrong way is obvious.",
+  "Check whether guests can actually reach a ride: per station it reports the entrance and exit, the exact tile a footpath must occupy to connect to each (connectAt), and whether a path is there at the right height — plus a flat `problems` list naming what to fix. Use this instead of reading a footpath's `edges`, which only records path-to-path links and never shows a connection to a ride entrance. A ride needs BOTH entrance and exit connected; when one is missing, `entranceSites` lists every tile that will hold it (feed one to build_ride_entrance). Stalls and facilities have no entrance element: they are checked against the one side the shop faces, reported as `entranceTile`, with every neighbouring side listed so a shop built facing the wrong way is obvious. `connected` here is a local check only — it means a footpath tile sits on the correct apron tile at the correct z next to the door, nothing more. It is not a guarantee that an unbroken, walkable route exists all the way back to the park entrance: a station can report connected while still being unreachable by general guest traffic, for instance if every route to it passes through a tile that is a queue line bound to a different ride (see get_tile_detail's isQueue/ride fields).",
   { ride_id: z.number().int().describe("Ride or shop id from list_rides / list_shops") },
   Methods.CheckRideAccess);
 
@@ -324,6 +324,96 @@ passthrough("remove_shop",
   "Demolish one stall or facility and refund what the game gives back. Takes the tile with it — no separate track removal. Use this to back out a bad placement, or to rebuild a shop facing a different direction. Rides are not accepted; this only removes shops.",
   { ride_id: z.number().int().describe("Shop id from list_shops or build_shop") },
   Methods.RemoveShop);
+
+// ===========================================================================
+// 2d. BUILD — flat rides
+// ===========================================================================
+
+passthrough("list_ride_types",
+  "List the FLAT rides this park can build, with the `object` index build_ride takes: merry-go-round, ferris wheel, "
+  + "dodgems, haunted house, top spin and the rest — one track piece each, so build_ride places them whole. "
+  + "Tracked rides (roller coasters, transport rides) are deliberately absent: they are built by laying track piece by "
+  + "piece and this agent cannot do that. Each entry gives the `footprint` in tiles and the `originOffset` — where the "
+  + "x,y you pass to build_ride sits inside that block, which is the centre for every 3x3 ride, not a corner. "
+  + "Only researched types are returned by default.",
+  {
+    include_unresearched: z.boolean().optional()
+      .describe("Also list types that are loaded but not yet researched (default false). They cannot be built until research unlocks them."),
+  },
+  Methods.ListRideTypes,
+  { map: (a) => (a.include_unresearched === undefined ? {} : { include_unresearched: a.include_unresearched }) });
+
+passthrough("build_ride",
+  "Build ONE flat ride and, unless you say otherwise, its entrance and exit with it. "
+  + "The ride covers a block of tiles, not one: check `footprint` and `originOffset` in list_ride_types first, because "
+  + "x,y is the piece's origin and for a 3x3 ride that is the CENTRE tile — a merry-go-round at (50,50) covers "
+  + "(49,49) to (51,51). Every tile in that block must be owned, clear and level; z defaults to the highest ground "
+  + "corner under the block. "
+  + "Only certain sides of the block will hold an entrance — the game accepts a build on any tile and then silently "
+  + "deletes an entrance on a side the track piece does not allow, so this tool picks from the legal sides only, "
+  + "preferring one a footpath already reaches. Pass entrance_x/entrance_y or exit_x/exit_y to place them yourself; "
+  + "the result's `otherEntranceSites` lists what else was available. "
+  + "The result reports each piece's `connectAt` — the tile guests walk on to reach it. "
+  + "A new ride is CLOSED and priced at 0: follow up with set_ride_price and open_ride, and run a queue line "
+  + "(place_path with queue:true) up to the entrance's connectAt or nobody can ride it. "
+  + "Errors carry the game's own reason; read it and adjust.",
+  {
+    x: z.number().int().describe("Origin tile X — see originOffset from list_ride_types; not always a corner."),
+    y: z.number().int().describe("Origin tile Y."),
+    object: z.number().int().describe("Ride object index from list_ride_types."),
+    direction: z.number().int().min(0).max(3).optional()
+      .describe("Rotation of the ride, 0-3 (default 0). Rotates the footprint and which sides take the entrance."),
+    z: z.number().int().optional().describe("Exact world z. Omit to sit on the ground under the footprint."),
+    height_offset: z.number().int().optional().describe("Land levels above the resolved z (default 0)."),
+    name: z.string().optional().describe("Custom name for the ride. Omit for the game's default."),
+    place_entrance_exit: z.boolean().optional()
+      .describe("Build the entrance and exit too (default true). Set false to place them yourself with build_ride_entrance."),
+    entrance_x: z.number().int().optional().describe("Force the entrance onto this tile. Must be one the track piece allows."),
+    entrance_y: z.number().int().optional(),
+    exit_x: z.number().int().optional().describe("Force the exit onto this tile. Must be one the track piece allows."),
+    exit_y: z.number().int().optional(),
+  },
+  Methods.BuildRide,
+  { map: (a) => {
+    const o: Record<string, unknown> = { x: a.x, y: a.y, object: a.object };
+    if (a.direction !== undefined) o.direction = a.direction;
+    if (a.z !== undefined) o.z = a.z;
+    if (a.height_offset !== undefined) o.height_offset = a.height_offset;
+    if (a.name !== undefined) o.name = a.name;
+    if (a.place_entrance_exit !== undefined) o.place_entrance_exit = a.place_entrance_exit;
+    if (a.entrance_x !== undefined) o.entrance_x = a.entrance_x;
+    if (a.entrance_y !== undefined) o.entrance_y = a.entrance_y;
+    if (a.exit_x !== undefined) o.exit_x = a.exit_x;
+    if (a.exit_y !== undefined) o.exit_y = a.exit_y;
+    return o;
+  } });
+
+passthrough("build_ride_entrance",
+  "Build or move one ride entrance or exit, for fixing up what build_ride could not place. The ride must be CLOSED. "
+  + "x,y is the tile the little building stands on — it must be one the track piece allows, which check_ride_access "
+  + "and build_ride both report as `entranceSites`; anywhere else the game accepts the build and then deletes it. "
+  + "Placing over an existing entrance moves it. The result gives `connectAt`, the tile guests walk on to reach it.",
+  {
+    ride_id: z.number().int().describe("Ride id from list_rides."),
+    x: z.number().int().describe("Tile the entrance/exit building stands on."),
+    y: z.number().int(),
+    is_exit: z.boolean().optional().describe("True for the exit, false (default) for the entrance."),
+    station: z.number().int().optional().describe("Station index (default 0). Flat rides only ever have station 0."),
+  },
+  Methods.BuildRideEntrance,
+  { map: (a) => {
+    const o: Record<string, unknown> = { ride_id: a.ride_id, x: a.x, y: a.y };
+    if (a.is_exit !== undefined) o.is_exit = a.is_exit;
+    if (a.station !== undefined) o.station = a.station;
+    return o;
+  } });
+
+passthrough("remove_ride",
+  "Demolish one ride and refund what the game gives back. Takes its track, entrance and exit with it. "
+  + "Use this to back out a bad placement or to rebuild a ride at a different rotation — there is no rotate action. "
+  + "Stalls and facilities are not accepted; remove those with remove_shop.",
+  { ride_id: z.number().int().describe("Ride id from list_rides or build_ride") },
+  Methods.RemoveRide);
 
 // ===========================================================================
 // 3. SEE — vision
